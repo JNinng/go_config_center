@@ -1,0 +1,183 @@
+// Package api 提供 HTTP 接口（DESIGN §5）：写走 Raft 提案并回传 Apply 结果，读本机 PG。
+package api
+
+import (
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/jninng/go_config_center/internal/raftlog"
+	"github.com/jninng/go_config_center/internal/store"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// 提案失败原因，由 Proposer 实现方返回，映射为 DESIGN §4.1 的响应语义。
+var (
+	ErrNoLeader       = errors.New("当前无 Leader（选举中或已失主）")
+	ErrRaftDown       = errors.New("Raft 已关闭")
+	ErrProposeTimeout = errors.New("提案未在期限内提交")
+)
+
+// Proposer 将一条日志信封经 Raft 提交，等待该日志应用完成后取回结果（DESIGN §3.3）。
+type Proposer interface {
+	Propose(ctx context.Context, cmd []byte) (raftlog.Result, error)
+}
+
+type Server struct {
+	proposer   Proposer
+	store      *store.Store
+	adminToken string
+	ready      func() bool
+}
+
+func New(p Proposer, st *store.Store, adminToken string, ready func() bool) *Server {
+	return &Server{proposer: p, store: st, adminToken: adminToken, ready: ready}
+}
+
+func (s *Server) Routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/namespaces/{ns}/configs/{data_id}", s.handlePublish)
+	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}", s.handleGet)
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	mux.Handle("GET /metrics", promhttp.Handler())
+	return mux
+}
+
+type publishBody struct {
+	Content         string            `json:"content"`
+	DataType        string            `json:"data_type"`
+	Tags            map[string]string `json:"tags"`
+	ExpectedVersion *int64            `json:"expected_version"`
+}
+
+// handlePublish 处理 Publish（DESIGN §5.1）：
+// 认证 → 参数校验 → Raft 提案 → 等待 Apply 取回结果 → 200/409/404。
+func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	ns, dataId := r.PathValue("ns"), r.PathValue("data_id")
+
+	r.Body = http.MaxBytesReader(w, r.Body, raftlog.MaxContentBytes+64*1024)
+	var body publishBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		badRequest(w, err)
+		return
+	}
+
+	cmd, err := raftlog.NewPublish(raftlog.PublishData{
+		Namespace:       ns,
+		DataId:          dataId,
+		DataType:        body.DataType,
+		Content:         body.Content,
+		Tags:            body.Tags,
+		ExpectedVersion: body.ExpectedVersion,
+		Actor:           "admin",
+	})
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+	b, err := raftlog.Encode(cmd)
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+
+	res, err := s.proposer.Propose(r.Context(), b)
+	switch {
+	case errors.Is(err, ErrNoLeader), errors.Is(err, ErrRaftDown):
+		// DESIGN §4.1：无 Leader 时 503 + Retry-After（307 重定向属后续票）。
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_leader"})
+		return
+	case errors.Is(err, ErrProposeTimeout):
+		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"error": "propose_timeout"})
+		return
+	case err != nil:
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "propose_failed", "message": err.Error()})
+		return
+	}
+
+	switch res.Status {
+	case raftlog.StatusOK:
+		writeJSON(w, http.StatusOK, map[string]any{"version": res.Version, "created": res.Created})
+	case raftlog.StatusVersionConflict:
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "version_conflict", "current_version": res.CurrentVersion})
+	case raftlog.StatusNotFound:
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
+	}
+}
+
+// handleGet 读当前条目（本机 PG，允许陈旧；DESIGN §5.1）。
+func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	entry, err := s.store.GetEntry(r.Context(), r.PathValue("ns"), r.PathValue("data_id"))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+		return
+	}
+	if entry == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+		return
+	}
+	tags := entry.Tags
+	if tags == nil {
+		tags = map[string]string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"namespace":  entry.Namespace,
+		"data_id":    entry.DataId,
+		"data_type":  entry.DataType,
+		"content":    entry.Content,
+		"version":    entry.Version,
+		"tags":       tags,
+		"created_at": entry.CreatedAt,
+		"updated_at": entry.UpdatedAt,
+	})
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if err := s.store.Pool().Ping(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unhealthy", "pg": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if s.ready == nil || !s.ready() {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
+}
+
+func (s *Server) authorized(r *http.Request) bool {
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if len(auth) <= len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), []byte(s.adminToken)) == 1
+}
+
+func writeJSON(w http.ResponseWriter, code int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func badRequest(w http.ResponseWriter, err error) {
+	writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "message": err.Error()})
+}

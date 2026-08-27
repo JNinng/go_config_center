@@ -296,8 +296,8 @@ config-center --config config.yaml
 ## 9. 实施阶段
 
 ### Phase 1 — 单节点 MVP
-- [ ] PG 三表 schema 与启动迁移
-- [ ] Raft 集成：boltdb LogStore + FileSnapshotStore + 单节点 Bootstrap
+- [x] PG 三表 schema 与启动迁移
+- [x] Raft 集成：boltdb LogStore + FileSnapshotStore + 单节点 Bootstrap
 - [ ] PostgresFSM：Apply（三操作 + 幂等跳过 + 结果表）、快照导出、跳过式 Restore、Serving 门闩
 - [ ] 配置 API：PUT/GET/DELETE + CAS；History/Rollback API；Watch 长轮询
 - [ ] Admin Token 认证、/healthz、/readyz、/metrics

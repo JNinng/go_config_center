@@ -1,0 +1,21 @@
+# config-center 配置样例（复制为 config.yaml 后按环境修改）
+
+# 留空则首次启动生成 UUID 并持久化到 <data_dir>/node-id
+node_id: ""
+http_addr: "127.0.0.1:8080"
+# Raft 对外通告地址（成员间复制流量）
+raft_addr: "127.0.0.1:7946"
+data_dir: "./data"
+admin_token: "change-me"
+
+pg_dsn: "host=127.0.0.1 port=5432 user=postgresql dbname=config_center_1 sslmode=disable"
+
+# Seed List：仅用于启动时寻找 Leader，不是集群成员清单；
+# 成员真相源是 Raft 自身成员表（ADR-0008）
+seeds:
+  - "127.0.0.1:7946"
+
+raft:
+  snapshot_threshold: 10000   # 已应用日志达到该条数触发快照
+  snapshot_retention: 2       # 本地保留快照个数
+  trailing_logs: 10240        # 快照点之后保留的日志条数
