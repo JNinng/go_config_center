@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 	"github.com/jninng/go_config_center/internal/api"
 	"github.com/jninng/go_config_center/internal/config"
+	"github.com/jninng/go_config_center/internal/discovery"
 	"github.com/jninng/go_config_center/internal/fsm"
 	"github.com/jninng/go_config_center/internal/nodeid"
 	"github.com/jninng/go_config_center/internal/raftlog"
@@ -114,9 +116,9 @@ func main() {
 		} else if idx > 0 {
 			fatal(logger, "--bootstrap 拒绝执行", fmt.Errorf("PG raft_fsm_meta.last_applied_index=%d > 0，要求空库（灾难恢复流程见 DESIGN §6.4）", idx))
 		}
-	} else if !hasState {
-		fatal(logger, "无法启动", fmt.Errorf("数据目录 %s 无集群状态：全新集群仅首节点执行一次 --bootstrap，其余节点走 Join（后续票实现）", raftDir))
 	}
+	// 非 bootstrap 节点不再因无集群态而退出：由发现代理经 Seed List 加入（ADR-0008，
+	// 永不自举）；已有状态的节点由 Raft 成员表自愈，发现代理仅跟踪 Leader 地址。
 
 	r, err := raft.NewRaft(raftCfg, machine, boltStore, boltStore, snapStore, transport)
 	if err != nil {
@@ -186,6 +188,91 @@ func main() {
 	proposer := &raftProposer{raft: r}
 	// /readyz 与读 API 的 Serving 判定：门闩（全量恢复中为 false）且 Raft 非 Shutdown。
 	ready := func() bool { return machine.Serving() && r.State() != raft.Shutdown }
+
+	// 集群视角：Leader HTTP 地址缓存放行 307 重定向；本节点为 Leader 时即自身通告地址。
+	var leaderHTTPCache atomic.Value
+	clusterInfo := func() api.ClusterInfo {
+		role := strings.ToLower(r.State().String())
+		leaderAddr, leaderID := r.LeaderWithID()
+		term, _ := strconv.ParseUint(r.Stats()["term"], 10, 64)
+		httpAddr := ""
+		if role == "leader" {
+			httpAddr = cfg.HTTPAdvertise
+		} else if v, ok := leaderHTTPCache.Load().(string); ok {
+			httpAddr = v
+		}
+		lastApplied, _ := machine.LastApplied()
+		return api.ClusterInfo{
+			NodeID:      nodeID,
+			Role:        role,
+			Term:        term,
+			LeaderID:    string(leaderID),
+			LeaderAddr:  string(leaderAddr),
+			LeaderHTTP:  httpAddr,
+			LastApplied: lastApplied,
+			Restoring:   !machine.Serving(),
+		}
+	}
+	members := func() ([]api.MemberInfo, error) {
+		f := r.GetConfiguration()
+		if err := f.Error(); err != nil {
+			return nil, fmt.Errorf("读取成员表: %w", err)
+		}
+		out := make([]api.MemberInfo, 0, len(f.Configuration().Servers))
+		for _, srv := range f.Configuration().Servers {
+			out = append(out, api.MemberInfo{
+				NodeID:   string(srv.ID),
+				Addr:     string(srv.Address),
+				Suffrage: srv.Suffrage.String(),
+			})
+		}
+		return out, nil
+	}
+	// joinFn 在 Leader 上执行成员加入。同 Node ID 换地址时按新地址覆盖（幂等语义）。
+	// 注：直接以 voter 加入——上游库的 staging 自动转正从未实现（membership.md 仅提案），
+	// AddVoter 缺省即 Voter，与 Consul 等生产用法一致（DESIGN §4.5 注记）。
+	joinFn := func(peerID, peerRaftAddr, _ string) (bool, error) {
+		f := r.GetConfiguration()
+		if err := f.Error(); err != nil {
+			return false, fmt.Errorf("读取成员表: %w", err)
+		}
+		for _, srv := range f.Configuration().Servers {
+			if srv.ID == raft.ServerID(peerID) && srv.Address == raft.ServerAddress(peerRaftAddr) {
+				return true, nil
+			}
+		}
+		addF := r.AddVoter(raft.ServerID(peerID), raft.ServerAddress(peerRaftAddr), 0, 10*time.Second)
+		if err := addF.Error(); err != nil {
+			switch {
+			case errors.Is(err, raft.ErrNotLeader), errors.Is(err, raft.ErrLeadershipLost):
+				return false, api.ErrNoLeader
+			case errors.Is(err, raft.ErrRaftShutdown):
+				return false, api.ErrRaftDown
+			default:
+				return false, fmt.Errorf("AddVoter: %w", err)
+			}
+		}
+		return false, nil
+	}
+
+	if !*bootstrap {
+		seeds := make([]string, 0, len(cfg.Seeds))
+		for _, s := range cfg.Seeds {
+			if !strings.Contains(s, "://") {
+				s = "http://" + s
+			}
+			seeds = append(seeds, s)
+		}
+		go discovery.Run(context.Background(), logger, discovery.Options{
+			NodeID:        nodeID,
+			RaftAddr:      cfg.RaftAddr,
+			HTTPAdvertise: cfg.HTTPAdvertise,
+			Seeds:         seeds,
+			AdminToken:    cfg.AdminToken,
+			OnLeader:      func(addr string) { leaderHTTPCache.Store(addr) },
+		}, hasState)
+	}
+
 	snapshotTrigger := func() (uint64, error) {
 		f := r.Snapshot()
 		if err := f.Error(); err != nil {
@@ -207,7 +294,17 @@ func main() {
 		_ = rc.Close()
 		return meta.Index, nil
 	}
-	mux := api.New(proposer, st, hub, cfg.AdminToken, ready, snapshotTrigger).Routes()
+	mux := api.New(api.Deps{
+		Proposer:    proposer,
+		Store:       st,
+		Hub:         hub,
+		AdminToken:  cfg.AdminToken,
+		Ready:       ready,
+		Snapshot:    snapshotTrigger,
+		ClusterInfo: clusterInfo,
+		Members:     members,
+		Join:        joinFn,
+	}).Routes()
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)

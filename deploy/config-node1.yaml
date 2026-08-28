@@ -1,0 +1,9 @@
+http_addr: ":8080"
+raft_addr: "node1:7946"
+data_dir: "/var/lib/gcc"
+admin_token: "change-me"
+pg_dsn: "host=pg1 user=config password=config dbname=config_center sslmode=disable"
+http_advertise: "http://node1:8080"
+seeds:
+  - "http://node2:8080"
+  - "http://node3:8080"

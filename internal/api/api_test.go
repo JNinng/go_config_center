@@ -34,7 +34,7 @@ func mustStore(t *testing.T) *store.Store {
 func mustServer(t *testing.T, ready func() bool, snap func() (uint64, error)) (*Server, *store.Store, func()) {
 	t.Helper()
 	st := mustStore(t)
-	return New(nil, st, nil, "tok", ready, snap), st, func() {}
+	return New(Deps{Proposer: nil, Store: st, Hub: nil, AdminToken: "tok", Ready: ready, Snapshot: snap}), st, func() {}
 }
 
 // fakeProposer 以预置结果模拟 Raft 提案，用于端点语义映射测试。
@@ -157,7 +157,7 @@ func TestDeleteEndpoint(t *testing.T) {
 
 	do := func(t *testing.T, p Proposer, auth, url string) *http.Response {
 		t.Helper()
-		ts := httptest.NewServer(New(p, st, watch.NewHub(), "tok", func() bool { return true }, nil).Routes())
+		ts := httptest.NewServer(New(Deps{Proposer: p, Store: st, Hub: watch.NewHub(), AdminToken: "tok", Ready: func() bool { return true }, Snapshot: nil}).Routes())
 		defer ts.Close()
 		req, _ := http.NewRequest(http.MethodDelete, ts.URL+url, nil)
 		if auth != "" {
@@ -233,7 +233,7 @@ func TestVersionsEndpoint(t *testing.T) {
 		t.Fatalf("delete = %+v %v", res, err)
 	}
 
-	ts := httptest.NewServer(New(nil, st, nil, "tok", func() bool { return true }, nil).Routes())
+	ts := httptest.NewServer(New(Deps{Proposer: nil, Store: st, Hub: nil, AdminToken: "tok", Ready: func() bool { return true }, Snapshot: nil}).Routes())
 	defer ts.Close()
 
 	get := func(t *testing.T, query string) []map[string]any {
@@ -290,7 +290,7 @@ func TestRollbackEndpoint(t *testing.T) {
 
 	do := func(t *testing.T, p Proposer, auth, body string) *http.Response {
 		t.Helper()
-		ts := httptest.NewServer(New(p, st, watch.NewHub(), "tok", func() bool { return true }, nil).Routes())
+		ts := httptest.NewServer(New(Deps{Proposer: p, Store: st, Hub: watch.NewHub(), AdminToken: "tok", Ready: func() bool { return true }, Snapshot: nil}).Routes())
 		defer ts.Close()
 		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/namespaces/dev/configs/a/rollback", strings.NewReader(body))
 		if auth != "" {
@@ -367,7 +367,7 @@ func watchGet(t *testing.T, base, query string) (int, map[string]any, time.Durat
 func TestWatchImmediateAndTimeout(t *testing.T) {
 	st := mustStore(t)
 	hub := watch.NewHub()
-	ts := httptest.NewServer(New(nil, st, hub, "tok", func() bool { return true }, nil).Routes())
+	ts := httptest.NewServer(New(Deps{Store: st, Hub: hub, AdminToken: "tok", Ready: func() bool { return true }}).Routes())
 	defer ts.Close()
 	ctx := context.Background()
 	base := ts.URL + "/v1/namespaces/dev/configs/a/watch"
@@ -425,7 +425,7 @@ func TestWatchImmediateAndTimeout(t *testing.T) {
 func TestWatchWakeOnNotify(t *testing.T) {
 	st := mustStore(t)
 	hub := watch.NewHub()
-	ts := httptest.NewServer(New(nil, st, hub, "tok", func() bool { return true }, nil).Routes())
+	ts := httptest.NewServer(New(Deps{Store: st, Hub: hub, AdminToken: "tok", Ready: func() bool { return true }}).Routes())
 	defer ts.Close()
 	ctx := context.Background()
 
@@ -467,7 +467,7 @@ func TestWatchWakeOnNotify(t *testing.T) {
 func TestWatchClientDisconnectReleasesHandler(t *testing.T) {
 	st := mustStore(t)
 	hub := watch.NewHub()
-	ts := httptest.NewServer(New(nil, st, hub, "tok", func() bool { return true }, nil).Routes())
+	ts := httptest.NewServer(New(Deps{Store: st, Hub: hub, AdminToken: "tok", Ready: func() bool { return true }}).Routes())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/namespaces/dev/configs/a/watch?v=0&timeout=60s", nil)
@@ -491,7 +491,7 @@ func TestWatchClientDisconnectReleasesHandler(t *testing.T) {
 // 验收：无 token / 错 token 的写请求 401，正确 token 通过。
 func TestWriteEndpointsRequireAdminToken(t *testing.T) {
 	st := mustStore(t)
-	ts := httptest.NewServer(New(fakeProposer{res: raftlog.OK(1, true)}, st, watch.NewHub(), "tok", func() bool { return true }, nil).Routes())
+	ts := httptest.NewServer(New(Deps{Proposer: fakeProposer{res: raftlog.OK(1, true)}, Store: st, Hub: watch.NewHub(), AdminToken: "tok", Ready: func() bool { return true }, Snapshot: nil}).Routes())
 	defer ts.Close()
 
 	cases := []struct {
@@ -535,7 +535,7 @@ func TestWriteEndpointsRequireAdminToken(t *testing.T) {
 // 验收：/healthz 在 PG 断连时转为不健康。
 func TestHealthzReflectsPGConnectivity(t *testing.T) {
 	st := mustStore(t)
-	ts := httptest.NewServer(New(nil, st, watch.NewHub(), "tok", func() bool { return true }, nil).Routes())
+	ts := httptest.NewServer(New(Deps{Proposer: nil, Store: st, Hub: watch.NewHub(), AdminToken: "tok", Ready: func() bool { return true }, Snapshot: nil}).Routes())
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/healthz")
@@ -584,5 +584,214 @@ func TestReadyzReflectsServingLatch(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("门闩打开后 readyz = %d, want 200", resp.StatusCode)
+	}
+}
+
+// 写门闩（DESIGN §4.1）：Follower 已知 Leader → 307（保留路径与查询串）；
+// Leader 地址未知或 candidate → 503 + Retry-After；Leader 放行。
+func TestWriteGateRedirects(t *testing.T) {
+	st := mustStore(t)
+	mk := func(info ClusterInfo) *httptest.Server {
+		return httptest.NewServer(New(Deps{
+			Proposer:    fakeProposer{res: raftlog.OK(7, true)},
+			Store:       st,
+			AdminToken:  "tok",
+			Ready:       func() bool { return true },
+			ClusterInfo: func() ClusterInfo { return info },
+		}).Routes())
+	}
+
+	ts := mk(ClusterInfo{Role: "follower", LeaderHTTP: "http://leader:8080"})
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/namespaces/dev/configs/a?expected_version=3", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("follower DELETE = %d, want 307", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "http://leader:8080/v1/namespaces/dev/configs/a?expected_version=3" {
+		t.Fatalf("Location = %q, want 保留路径与查询串", loc)
+	}
+	ts.Close()
+
+	for name, info := range map[string]ClusterInfo{
+		"follower 无 Leader 地址": {Role: "follower"},
+		"candidate":            {Role: "candidate"},
+	} {
+		ts = mk(info)
+		req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/namespaces/dev/configs/a", strings.NewReader(`{"content":"x","data_type":"TEXT"}`))
+		req.Header.Set("Authorization", "Bearer tok")
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+			t.Fatalf("%s PUT = %d, want 503 + Retry-After", name, resp.StatusCode)
+		}
+		ts.Close()
+	}
+
+	ts = mk(ClusterInfo{Role: "leader"})
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/namespaces/dev/configs/a", strings.NewReader(`{"content":"x","data_type":"TEXT"}`))
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("leader PUT = %d, want 200（放行进入提案）", resp.StatusCode)
+	}
+	ts.Close()
+}
+
+// /internal/discovery（DESIGN §5.3）：不认证，返回 node_id/role/leader_addr/leader_http_addr。
+func TestDiscoveryEndpoint(t *testing.T) {
+	st := mustStore(t)
+	ts := httptest.NewServer(New(Deps{
+		Store: st,
+		Ready: func() bool { return true },
+		ClusterInfo: func() ClusterInfo {
+			return ClusterInfo{NodeID: "n1", Role: "leader", LeaderAddr: "127.0.0.1:7946", LeaderHTTP: "http://127.0.0.1:8080"}
+		},
+	}).Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/internal/discovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("discovery = %d, want 200", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["node_id"] != "n1" || body["role"] != "leader" ||
+		body["leader_addr"] != "127.0.0.1:7946" || body["leader_http_addr"] != "http://127.0.0.1:8080" {
+		t.Fatalf("body = %v", body)
+	}
+}
+
+// join 端点：Leader 上执行 JoinFunc，幂等（exists → 200）；参数缺失 400；Follower 307。
+func TestJoinEndpoint(t *testing.T) {
+	st := mustStore(t)
+	var calls []string
+	mk := func(info ClusterInfo) *httptest.Server {
+		return httptest.NewServer(New(Deps{
+			Store: st, AdminToken: "tok",
+			Ready:       func() bool { return true },
+			ClusterInfo: func() ClusterInfo { return info },
+			Join: func(nodeID, raftAddr, httpAddr string) (bool, error) {
+				calls = append(calls, nodeID+"@"+raftAddr)
+				return len(calls) > 1, nil // 第二次视为已存在
+			},
+		}).Routes())
+	}
+
+	ts := mk(ClusterInfo{NodeID: "n1", Role: "leader", LeaderHTTP: "http://n1:8080"})
+	do := func(t *testing.T, body string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/cluster/join", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	resp := do(t, `{"node_id":"n2","raft_addr":"127.0.0.1:7947","http_addr":"http://127.0.0.1:8081"}`)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("首次 join = %d, want 202", resp.StatusCode)
+	}
+	resp = do(t, `{"node_id":"n2","raft_addr":"127.0.0.1:7947","http_addr":"http://127.0.0.1:8081"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("重复 join = %d, want 200（幂等）", resp.StatusCode)
+	}
+	resp = do(t, `{"raft_addr":"127.0.0.1:7947"}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("缺 node_id = %d, want 400", resp.StatusCode)
+	}
+	ts.Close()
+
+	// Follower 收到 Join → 307 指向 Leader。
+	followerTS := mk(ClusterInfo{Role: "follower", LeaderHTTP: "http://n1:8080"})
+	req, _ := http.NewRequest(http.MethodPost, followerTS.URL+"/v1/cluster/join", strings.NewReader(`{"node_id":"n2","raft_addr":"127.0.0.1:7947"}`))
+	req.Header.Set("Authorization", "Bearer tok")
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("follower join = %d, want 307", resp.StatusCode)
+	}
+	followerTS.Close()
+}
+
+// cluster/status（DESIGN §5.2）：返回本节点视角与成员表。
+func TestStatusEndpoint(t *testing.T) {
+	st := mustStore(t)
+	ts := httptest.NewServer(New(Deps{
+		Store: st, AdminToken: "tok",
+		Ready: func() bool { return true },
+		ClusterInfo: func() ClusterInfo {
+			return ClusterInfo{NodeID: "n1", Role: "leader", Term: 5, LeaderID: "n1",
+				LeaderAddr: "127.0.0.1:7946", LeaderHTTP: "http://127.0.0.1:8080",
+				LastApplied: 42, Restoring: false}
+		},
+		Members: func() ([]MemberInfo, error) {
+			return []MemberInfo{
+				{NodeID: "n1", Addr: "127.0.0.1:7946", Suffrage: "Voter"},
+				{NodeID: "n2", Addr: "127.0.0.1:7947", Suffrage: "Staging"},
+			}, nil
+		},
+	}).Routes())
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/cluster/status", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		NodeID      string `json:"node_id"`
+		Role        string `json:"role"`
+		Term        uint64 `json:"term"`
+		LastApplied uint64 `json:"last_applied_index"`
+		Restoring   bool   `json:"restoring"`
+		MemberCount int    `json:"-"`
+		Members     []struct {
+			NodeID   string `json:"node_id"`
+			Addr     string `json:"addr"`
+			Suffrage string `json:"suffrage"`
+		} `json:"members"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.NodeID != "n1" || body.Role != "leader" || body.Term != 5 ||
+		body.LastApplied != 42 || body.Restoring || len(body.Members) != 2 ||
+		body.Members[1].Suffrage != "Staging" {
+		t.Fatalf("status body = %+v", body)
 	}
 }

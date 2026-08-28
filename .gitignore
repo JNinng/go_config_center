@@ -32,3 +32,6 @@ go.work.sum
 # 本地开发产物
 data/
 config.yaml
+
+# e2e 多节点拓扑数据目录
+data-*/

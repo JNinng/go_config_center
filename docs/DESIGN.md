@@ -171,7 +171,7 @@ Serving 门闩为进程内原子布尔；false 期间所有读 API 返回 **503 
 
 **Bootstrap**（ADR-0008）：全新集群仅在首节点执行一次 `--bootstrap`（单 voter 集群）；本地已有集群态时该命令必须报错退出。其余节点永久禁止自举——不存在"探测失败则自举"的路径。
 
-**Join**：新节点/重连节点启动后扫描 Seed List（排除自身地址），逐个调 `GET /internal/discovery`：对方为 Leader → 向其 `POST /v1/cluster/join`；对方为 Follower → 从响应取 Leader 地址再试。全部不可达 → 指数退避重试，永不自举、不退出。Leader 收到 Join 后 `AddVoter`（以 staging 身份进入，复制追平后自动转正为 voter），接口幂等（已是成员 → 200）。
+**Join**：新节点/重连节点启动后扫描 Seed List（排除自身地址），逐个调 `GET /internal/discovery`：对方为 Leader → 向其 `POST /v1/cluster/join`；对方为 Follower → 从响应取 Leader 地址再试。全部不可达 → 指数退避重试，永不自举、不退出。Leader 收到 Join 后 `AddVoter`，接口幂等（已是成员 → 200）。注：直接以 voter 身份加入——hashicorp/raft 的 staging 自动转正从未实现（membership.md 仅提案未落地），显式 voter 加入与 Consul 等生产用法一致。
 
 **Remove**：`DELETE /v1/cluster/peers/{node_id}`，执行前护栏校验——**移除后所需 quorum 必须不大于剩余在线 voter 数**，不满足返回 409（Raft 库不提供此保护）。被移除节点观察到自身 Raft 进入 Shutdown 后以专用退出码（`EXIT_REMOVED = 42`）退出进程；部署单元将该退出码配置为不自动重启。
 
@@ -232,11 +232,12 @@ admin_token: "change-me"
 pg_dsn: "host=127.0.0.1 user=config dbname=config_center sslmode=disable password=..."
 
 # Seed List：仅用于启动时寻找 Leader，不是集群成员清单；
+# 值为对端节点的 HTTP 地址（发现代理经 /internal/discovery 寻找 Leader）；
 # 成员真相源是 Raft 自身成员表（ADR-0008）
 seeds:
-  - "192.168.1.10:7946"
-  - "192.168.1.11:7946"
-  - "192.168.1.12:7946"
+  - "192.168.1.10:8080"
+  - "192.168.1.11:8080"
+  - "192.168.1.12:8080"
 
 raft:
   snapshot_threshold: 10000   # 已应用日志达到该条数触发快照

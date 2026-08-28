@@ -36,6 +36,42 @@ type Proposer interface {
 // SnapshotTrigger 手动触发 FSM 快照，返回快照点 index。
 type SnapshotTrigger func() (uint64, error)
 
+// ClusterInfo 是本节点集群视角的瞬时快照（DESIGN §5.3）。
+type ClusterInfo struct {
+	NodeID      string
+	Role        string // leader | follower | candidate | shutdown
+	Term        uint64
+	LeaderID    string
+	LeaderAddr  string // Leader 的 Raft 地址
+	LeaderHTTP  string // 本节点已知的 Leader HTTP 基地址（可为空；自身为 Leader 时即通告地址）
+	LastApplied uint64
+	Restoring   bool
+}
+
+// MemberInfo 是成员表中的一条成员（DESIGN §5.2）。
+type MemberInfo struct {
+	NodeID   string `json:"node_id"`
+	Addr     string `json:"addr"`
+	Suffrage string `json:"suffrage"` // Voter | Staging | Nonvoter
+}
+
+// JoinFunc 在 Leader 上执行成员加入（AddVoter，staging 进入，DESIGN §4.5）。
+// exists=true 表示该 Node ID 已是成员（幂等）。
+type JoinFunc func(nodeID, raftAddr, httpAddr string) (exists bool, err error)
+
+// Deps 聚合 Server 的外部依赖；可选依赖缺省时按单节点语义兜底。
+type Deps struct {
+	Proposer    Proposer
+	Store       *store.Store
+	Hub         *watch.Hub
+	AdminToken  string
+	Ready       func() bool
+	Snapshot    SnapshotTrigger
+	ClusterInfo func() ClusterInfo
+	Members     func() ([]MemberInfo, error)
+	Join        JoinFunc
+}
+
 // Watch 挂起时长边界（DESIGN §4.3：默认 30s，客户端原样重挂）。
 const (
 	defaultWatchTimeout = 30 * time.Second
@@ -49,10 +85,25 @@ type Server struct {
 	adminToken string
 	ready      func() bool
 	snapshot   SnapshotTrigger
+	cluster    func() ClusterInfo
+	members    func() ([]MemberInfo, error)
+	join       JoinFunc
 }
 
-func New(p Proposer, st *store.Store, hub *watch.Hub, adminToken string, ready func() bool, snapshot SnapshotTrigger) *Server {
-	return &Server{proposer: p, store: st, hub: hub, adminToken: adminToken, ready: ready, snapshot: snapshot}
+func New(d Deps) *Server {
+	return &Server{
+		proposer: d.Proposer, store: d.Store, hub: d.Hub,
+		adminToken: d.AdminToken, ready: d.Ready, snapshot: d.Snapshot,
+		cluster: d.ClusterInfo, members: d.Members, join: d.Join,
+	}
+}
+
+// currentCluster 返回集群视角快照；未注入 ClusterInfo 时按单节点 Leader 兜底。
+func (s *Server) currentCluster() ClusterInfo {
+	if s.cluster == nil {
+		return ClusterInfo{Role: "leader"}
+	}
+	return s.cluster()
 }
 
 // httpRequestDuration 按 ServeMux 路由模式记录 API 延迟（DESIGN §7）。
@@ -83,11 +134,35 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/versions", s.handleVersions)
 	mux.HandleFunc("POST /v1/namespaces/{ns}/configs/{data_id}/rollback", s.handleRollback)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/watch", s.handleWatch)
+	mux.HandleFunc("POST /v1/cluster/join", s.handleJoin)
+	mux.HandleFunc("GET /v1/cluster/status", s.handleStatus)
 	mux.HandleFunc("POST /v1/cluster/snapshot", s.handleSnapshot)
+	mux.HandleFunc("GET /internal/discovery", s.handleDiscovery)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.Handler())
 	return withMetrics(mux)
+}
+
+// writeGate 是写与集群管理接口的前置门（DESIGN §4.1）：Leader 放行；
+// Follower 且已知 Leader HTTP 地址时 307（保留方法、路径与查询串，客户端原样重发）；
+// 其余（candidate、地址未知）返回 503 + Retry-After。返回 true 表示放行。
+func (s *Server) writeGate(w http.ResponseWriter, r *http.Request) bool {
+	info := s.currentCluster()
+	switch {
+	case info.Role == "leader":
+		return true
+	case info.Role == "follower" && info.LeaderHTTP != "":
+		location := info.LeaderHTTP + r.URL.Path
+		if r.URL.RawQuery != "" {
+			location += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, location, http.StatusTemporaryRedirect)
+		return false
+	}
+	w.Header().Set("Retry-After", "1")
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_leader"})
+	return false
 }
 
 type publishBody struct {
@@ -102,6 +177,9 @@ type publishBody struct {
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.writeGate(w, r) {
 		return
 	}
 	ns, dataId := r.PathValue("ns"), r.PathValue("data_id")
@@ -175,6 +253,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
+	if !s.writeGate(w, r) {
+		return
+	}
 	var expected *int64
 	if raw := r.URL.Query().Get("expected_version"); raw != "" {
 		v, err := strconv.ParseInt(raw, 10, 64)
@@ -223,6 +304,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.writeGate(w, r) {
 		return
 	}
 	var body struct {
@@ -451,6 +535,9 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
+	if !s.writeGate(w, r) {
+		return
+	}
 	if s.snapshot == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "snapshot_disabled"})
 		return
@@ -505,4 +592,105 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 
 func badRequest(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "message": err.Error()})
+}
+
+// handleDiscovery 供发现代理调用（DESIGN §5.3，不认证）：
+// 返回本节点身份与角色、及其所知 Leader 的 Raft/HTTP 地址。
+func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
+	if !s.ready() {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "restoring"})
+		return
+	}
+	info := s.currentCluster()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node_id":          info.NodeID,
+		"role":             info.Role,
+		"leader_addr":      info.LeaderAddr,
+		"leader_http_addr": info.LeaderHTTP,
+	})
+}
+
+// handleJoin 处理成员加入（DESIGN §4.5/§5.2）：Leader 执行 AddVoter（staging 进入，
+// 复制追平后自动转正）。接口幂等：已是成员（地址相同）返回 200。
+func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.writeGate(w, r) {
+		return
+	}
+	if s.join == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "join_disabled"})
+		return
+	}
+	var body struct {
+		NodeID   string `json:"node_id"`
+		RaftAddr string `json:"raft_addr"`
+		HTTPAddr string `json:"http_addr"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		badRequest(w, err)
+		return
+	}
+	if body.NodeID == "" || body.RaftAddr == "" {
+		badRequest(w, fmt.Errorf("node_id 与 raft_addr 必填"))
+		return
+	}
+
+	exists, err := s.join(body.NodeID, body.RaftAddr, body.HTTPAddr)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrNoLeader), errors.Is(err, ErrRaftDown):
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_leader"})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "join_failed", "message": err.Error()})
+		}
+		return
+	}
+	status := "added"
+	code := http.StatusAccepted
+	if exists {
+		status = "exists"
+		code = http.StatusOK
+	}
+	writeJSON(w, code, map[string]any{
+		"status":           status,
+		"leader_node_id":   s.currentCluster().NodeID,
+		"leader_http_addr": s.currentCluster().LeaderHTTP,
+	})
+}
+
+// handleStatus 返回本节点视角的集群视图（DESIGN §5.2，任意节点可调）。
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	info := s.currentCluster()
+	members := []MemberInfo{}
+	if s.members != nil {
+		m, err := s.members()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+			return
+		}
+		if m != nil {
+			members = m
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node_id":            info.NodeID,
+		"role":               info.Role,
+		"term":               info.Term,
+		"leader_id":          info.LeaderID,
+		"leader_addr":        info.LeaderAddr,
+		"leader_http_addr":   info.LeaderHTTP,
+		"last_applied_index": info.LastApplied,
+		"restoring":          info.Restoring,
+		"members":            members,
+	})
 }

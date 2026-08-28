@@ -11,9 +11,14 @@ admin_token: "change-me"
 pg_dsn: "host=127.0.0.1 port=5432 user=postgresql dbname=config_center_1 sslmode=disable"
 
 # Seed List：仅用于启动时寻找 Leader，不是集群成员清单；
-# 成员真相源是 Raft 自身成员表（ADR-0008）
+# 值为对端节点的 HTTP 地址（发现代理经 /internal/discovery 寻找 Leader）
 seeds:
-  - "127.0.0.1:7946"
+  - "127.0.0.1:8081"
+  - "127.0.0.1:8082"
+
+# 对外通告的 HTTP 基地址：307 重定向与 Join 响应使用；
+# 留空则按 raft_addr 主机 + http_addr 端口推导
+http_advertise: "http://127.0.0.1:8080"
 
 raft:
   snapshot_threshold: 10000   # 已应用日志达到该条数触发快照

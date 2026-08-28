@@ -1,0 +1,49 @@
+# 三节点开发拓扑：每节点 1 进程 + 1 独立 PostgreSQL（DESIGN §6.3）
+# 用法：docker compose up -d
+# 仅 node1 执行 --bootstrap（ADR-0008）；node2/3 经 Seed List 自动 Join。
+services:
+  pg1:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: config
+      POSTGRES_PASSWORD: config
+      POSTGRES_DB: config_center
+  pg2:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: config
+      POSTGRES_PASSWORD: config
+      POSTGRES_DB: config_center
+  pg3:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: config
+      POSTGRES_PASSWORD: config
+      POSTGRES_DB: config_center
+
+  node1:
+    build: .
+    depends_on: [pg1]
+    command: ["--config", "/etc/gcc/config.yaml", "--bootstrap"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/config-node1.yaml:/etc/gcc/config.yaml:ro
+
+  node2:
+    build: .
+    depends_on: [pg2]
+    command: ["--config", "/etc/gcc/config.yaml"]
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./deploy/config-node2.yaml:/etc/gcc/config.yaml:ro
+
+  node3:
+    build: .
+    depends_on: [pg3]
+    command: ["--config", "/etc/gcc/config.yaml"]
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./deploy/config-node3.yaml:/etc/gcc/config.yaml:ro
