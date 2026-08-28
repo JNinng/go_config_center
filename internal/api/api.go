@@ -55,9 +55,19 @@ type MemberInfo struct {
 	Suffrage string `json:"suffrage"` // Voter | Staging | Nonvoter
 }
 
-// JoinFunc 在 Leader 上执行成员加入（AddVoter，staging 进入，DESIGN §4.5）。
+// JoinFunc 在 Leader 上执行成员加入（AddVoter，DESIGN §4.5）。
 // exists=true 表示该 Node ID 已是成员（幂等）。
 type JoinFunc func(nodeID, raftAddr, httpAddr string) (exists bool, err error)
+
+// RemoveFunc 在 Leader 上执行成员移除（DESIGN §4.5）。护栏不满足返回 ErrQuorumGuard，
+// 目标非成员返回 ErrNotMember。
+type RemoveFunc func(nodeID string) error
+
+// 成员移除的失败语义（DESIGN §5.2）。
+var (
+	ErrNotMember   = errors.New("目标不是集群成员")
+	ErrQuorumGuard = errors.New("移除后剩余在线 voter 不足 quorum，拒绝移除")
+)
 
 // Deps 聚合 Server 的外部依赖；可选依赖缺省时按单节点语义兜底。
 type Deps struct {
@@ -70,6 +80,7 @@ type Deps struct {
 	ClusterInfo func() ClusterInfo
 	Members     func() ([]MemberInfo, error)
 	Join        JoinFunc
+	Remove      RemoveFunc
 }
 
 // Watch 挂起时长边界（DESIGN §4.3：默认 30s，客户端原样重挂）。
@@ -88,13 +99,14 @@ type Server struct {
 	cluster    func() ClusterInfo
 	members    func() ([]MemberInfo, error)
 	join       JoinFunc
+	remove     RemoveFunc
 }
 
 func New(d Deps) *Server {
 	return &Server{
 		proposer: d.Proposer, store: d.Store, hub: d.Hub,
 		adminToken: d.AdminToken, ready: d.Ready, snapshot: d.Snapshot,
-		cluster: d.ClusterInfo, members: d.Members, join: d.Join,
+		cluster: d.ClusterInfo, members: d.Members, join: d.Join, remove: d.Remove,
 	}
 }
 
@@ -136,6 +148,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/watch", s.handleWatch)
 	mux.HandleFunc("POST /v1/cluster/join", s.handleJoin)
 	mux.HandleFunc("GET /v1/cluster/status", s.handleStatus)
+	mux.HandleFunc("DELETE /v1/cluster/peers/{node_id}", s.handleRemovePeer)
 	mux.HandleFunc("POST /v1/cluster/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /internal/discovery", s.handleDiscovery)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -592,6 +605,36 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 
 func badRequest(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "message": err.Error()})
+}
+
+// handleRemovePeer 处理成员移除（DESIGN §4.5/§5.2）：Leader 执行前做 quorum 护栏校验。
+// 200 移除成功；404 非成员；409 护栏拒绝；409/503 同写语义（非 Leader）。
+func (s *Server) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.writeGate(w, r) {
+		return
+	}
+	if s.remove == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "remove_disabled"})
+		return
+	}
+	err := s.remove(r.PathValue("node_id"))
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{"status": "removed"})
+	case errors.Is(err, ErrNotMember):
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_member"})
+	case errors.Is(err, ErrQuorumGuard):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "quorum_guard"})
+	case errors.Is(err, ErrNoLeader), errors.Is(err, ErrRaftDown):
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_leader"})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "remove_failed", "message": err.Error()})
+	}
 }
 
 // handleDiscovery 供发现代理调用（DESIGN §5.3，不认证）：

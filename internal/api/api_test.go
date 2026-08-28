@@ -795,3 +795,70 @@ func TestStatusEndpoint(t *testing.T) {
 		t.Fatalf("status body = %+v", body)
 	}
 }
+
+// 移除端点（DESIGN §5.2）：200 / 404 not_member / 409 quorum_guard；非 Leader 307。
+func TestRemovePeerEndpoint(t *testing.T) {
+	st := mustStore(t)
+	mk := func(info ClusterInfo, remove RemoveFunc) *httptest.Server {
+		return httptest.NewServer(New(Deps{
+			Store: st, AdminToken: "tok",
+			Ready:       func() bool { return true },
+			ClusterInfo: func() ClusterInfo { return info },
+			Remove:      remove,
+		}).Routes())
+	}
+
+	ts := mk(ClusterInfo{NodeID: "n1", Role: "leader", LeaderHTTP: "http://n1:8080"},
+		func(nodeID string) error {
+			switch nodeID {
+			case "n3":
+				return nil
+			case "ghost":
+				return ErrNotMember
+			default:
+				return ErrQuorumGuard
+			}
+		})
+	do := func(t *testing.T, url string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodDelete, url, nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	resp := do(t, ts.URL+"/v1/cluster/peers/n3")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("移除成员 = %d, want 200", resp.StatusCode)
+	}
+	resp = do(t, ts.URL+"/v1/cluster/peers/ghost")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("移除非成员 = %d, want 404", resp.StatusCode)
+	}
+	resp = do(t, ts.URL+"/v1/cluster/peers/n2")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("护栏拒绝 = %d, want 409", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error"] != "quorum_guard" {
+		t.Fatalf("body = %v, want error=quorum_guard", body)
+	}
+	ts.Close()
+
+	followerTS := mk(ClusterInfo{Role: "follower", LeaderHTTP: "http://n1:8080"}, nil)
+	resp = do(t, followerTS.URL+"/v1/cluster/peers/n3")
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("follower 移除 = %d, want 307", resp.StatusCode)
+	}
+	followerTS.Close()
+}

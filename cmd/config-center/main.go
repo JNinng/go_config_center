@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -231,13 +233,17 @@ func main() {
 	// joinFn 在 Leader 上执行成员加入。同 Node ID 换地址时按新地址覆盖（幂等语义）。
 	// 注：直接以 voter 加入——上游库的 staging 自动转正从未实现（membership.md 仅提案），
 	// AddVoter 缺省即 Voter，与 Consul 等生产用法一致（DESIGN §4.5 注记）。
-	joinFn := func(peerID, peerRaftAddr, _ string) (bool, error) {
+	var peerHTTP sync.Map // ServerID → HTTP 基地址（Join 时登记，供移除护栏探活）
+	joinFn := func(peerID, peerRaftAddr, peerHTTPAddr string) (bool, error) {
 		f := r.GetConfiguration()
 		if err := f.Error(); err != nil {
 			return false, fmt.Errorf("读取成员表: %w", err)
 		}
 		for _, srv := range f.Configuration().Servers {
 			if srv.ID == raft.ServerID(peerID) && srv.Address == raft.ServerAddress(peerRaftAddr) {
+				if peerHTTPAddr != "" {
+					peerHTTP.Store(peerID, peerHTTPAddr)
+				}
 				return true, nil
 			}
 		}
@@ -252,7 +258,81 @@ func main() {
 				return false, fmt.Errorf("AddVoter: %w", err)
 			}
 		}
+		if peerHTTPAddr != "" {
+			peerHTTP.Store(peerID, peerHTTPAddr)
+		}
 		return false, nil
+	}
+	// probePeer 以 HTTP 探活判断成员在线（护栏依据；地址未知的成员按离线处理——
+	// 护栏失效方向为拒绝，不会误删）。
+	probePeer := func(peerID string, online func()) {
+		if v, ok := peerHTTP.Load(peerID); ok {
+			client := &http.Client{Timeout: 1500 * time.Millisecond}
+			resp, err := client.Get(v.(string) + "/internal/discovery")
+			if err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					online()
+				}
+			}
+		}
+	}
+	// removeFn 移除成员并执行 quorum 护栏（DESIGN §4.5）：移除后所需 quorum 必须
+	// 不大于剩余在线 voter 数（本节点 Leader 计入在线）。
+	removeFn := func(targetID string) error {
+		f := r.GetConfiguration()
+		if err := f.Error(); err != nil {
+			return fmt.Errorf("读取成员表: %w", err)
+		}
+		config := f.Configuration()
+		target := raft.ServerID(targetID)
+		targetVoter := false
+		remainingVoters := 0
+		for _, srv := range config.Servers {
+			if srv.ID == target {
+				targetVoter = srv.Suffrage == raft.Voter
+				continue
+			}
+			if srv.Suffrage == raft.Voter {
+				remainingVoters++
+			}
+		}
+		if !targetVoter {
+			return api.ErrNotMember
+		}
+		quorumAfter := remainingVoters/2 + 1
+		online := 1 // 本 Leader 自身
+		var guard sync.WaitGroup
+		for _, srv := range config.Servers {
+			if srv.ID == target || srv.Suffrage != raft.Voter {
+				continue
+			}
+			if srv.Address == raft.ServerAddress(cfg.RaftAddr) && srv.ID == raft.ServerID(nodeID) {
+				continue
+			}
+			guard.Add(1)
+			go func(id string) {
+				defer guard.Done()
+				probePeer(id, func() { online++ })
+			}(string(srv.ID))
+		}
+		guard.Wait()
+		if online < quorumAfter {
+			return fmt.Errorf("移除后 quorum=%d，剩余在线 voter=%d: %w", quorumAfter, online, api.ErrQuorumGuard)
+		}
+		rmF := r.RemoveServer(target, 0, 10*time.Second)
+		if err := rmF.Error(); err != nil {
+			switch {
+			case errors.Is(err, raft.ErrNotLeader), errors.Is(err, raft.ErrLeadershipLost):
+				return api.ErrNoLeader
+			case errors.Is(err, raft.ErrRaftShutdown):
+				return api.ErrRaftDown
+			default:
+				return fmt.Errorf("RemoveServer: %w", err)
+			}
+		}
+		peerHTTP.Delete(targetID)
+		return nil
 	}
 
 	if !*bootstrap {
@@ -304,7 +384,68 @@ func main() {
 		ClusterInfo: clusterInfo,
 		Members:     members,
 		Join:        joinFn,
+		Remove:      removeFn,
 	}).Routes()
+
+	// 被移除节点自退出（DESIGN §4.5）：以专用退出码 EXIT_REMOVED = 42 终止进程。
+	// 两条触发路径：① 库在收到不含自身的新配置时自动 Shutdown（ShutdownOnRemove，
+	// 通常发生在换主后）；② Leader 未变更时被移除节点收不到任何 raft 消息——
+	// 主动向 Leader 的 cluster/status 核对成员表，缺席即退出。查询失败不退出（保守）。
+	var gracefulExit atomic.Bool
+	go func() {
+		client := &http.Client{Timeout: 1500 * time.Millisecond}
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if r.State() == raft.Shutdown {
+				if gracefulExit.Load() {
+					return
+				}
+				logger.Error("本节点已被移出集群，进程退出", "exit_code", 42)
+				os.Exit(42)
+			}
+			if gracefulExit.Load() {
+				return
+			}
+			leaderHTTP := ""
+			if v, ok := leaderHTTPCache.Load().(string); ok {
+				leaderHTTP = v
+			}
+			if leaderHTTP == "" || strings.EqualFold(r.State().String(), "leader") {
+				continue
+			}
+			req, err := http.NewRequest(http.MethodGet, leaderHTTP+"/v1/cluster/status", nil)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("Authorization", "Bearer "+cfg.AdminToken)
+			resp, err := client.Do(req)
+			if err != nil {
+				continue
+			}
+			var status struct {
+				Members []struct {
+					NodeID string `json:"node_id"`
+				} `json:"members"`
+			}
+			err = json.NewDecoder(resp.Body).Decode(&status)
+			_ = resp.Body.Close()
+			if err != nil || resp.StatusCode != http.StatusOK {
+				continue
+			}
+			present := false
+			for _, m := range status.Members {
+				if m.NodeID == nodeID {
+					present = true
+					break
+				}
+			}
+			if !present {
+				logger.Error("本节点已被移出集群，进程退出", "exit_code", 42)
+				os.Exit(42)
+			}
+		}
+	}()
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
@@ -323,6 +464,7 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	logger.Info("收到退出信号，优雅关闭")
+	gracefulExit.Store(true)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
