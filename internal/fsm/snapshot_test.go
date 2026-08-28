@@ -112,7 +112,7 @@ func TestRestoreFullImportWhenBehind(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	f, err := New(context.Background(), st)
+	f, err := New(context.Background(), st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestRestoreRejectsCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(st.Close)
-		f, err := New(context.Background(), st)
+		f, err := New(context.Background(), st, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -217,7 +217,7 @@ func TestRestoreServingLatchDuringImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	f, err := New(context.Background(), st)
+	f, err := New(context.Background(), st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

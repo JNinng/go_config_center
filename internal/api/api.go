@@ -14,6 +14,7 @@ import (
 
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
+	"github.com/jninng/go_config_center/internal/watch"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -33,16 +34,23 @@ type Proposer interface {
 // SnapshotTrigger 手动触发 FSM 快照，返回快照点 index。
 type SnapshotTrigger func() (uint64, error)
 
+// Watch 挂起时长边界（DESIGN §4.3：默认 30s，客户端原样重挂）。
+const (
+	defaultWatchTimeout = 30 * time.Second
+	maxWatchTimeout     = 5 * time.Minute
+)
+
 type Server struct {
 	proposer   Proposer
 	store      *store.Store
+	hub        *watch.Hub
 	adminToken string
 	ready      func() bool
 	snapshot   SnapshotTrigger
 }
 
-func New(p Proposer, st *store.Store, adminToken string, ready func() bool, snapshot SnapshotTrigger) *Server {
-	return &Server{proposer: p, store: st, adminToken: adminToken, ready: ready, snapshot: snapshot}
+func New(p Proposer, st *store.Store, hub *watch.Hub, adminToken string, ready func() bool, snapshot SnapshotTrigger) *Server {
+	return &Server{proposer: p, store: st, hub: hub, adminToken: adminToken, ready: ready, snapshot: snapshot}
 }
 
 func (s *Server) Routes() *http.ServeMux {
@@ -52,6 +60,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /v1/namespaces/{ns}/configs/{data_id}", s.handleDelete)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/versions", s.handleVersions)
 	mux.HandleFunc("POST /v1/namespaces/{ns}/configs/{data_id}/rollback", s.handleRollback)
+	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/watch", s.handleWatch)
 	mux.HandleFunc("POST /v1/cluster/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
@@ -306,20 +315,112 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
 		return
 	}
-	tags := entry.Tags
+	writeJSON(w, http.StatusOK, entryJSON(entry))
+}
+
+// entryJSON 渲染 Config Entry 的当前态（GET 与 Watch active 共用）。
+func entryJSON(e *store.Entry) map[string]any {
+	tags := e.Tags
 	if tags == nil {
 		tags = map[string]string{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"namespace":  entry.Namespace,
-		"data_id":    entry.DataId,
-		"data_type":  entry.DataType,
-		"content":    entry.Content,
-		"version":    entry.Version,
+	return map[string]any{
+		"namespace":  e.Namespace,
+		"data_id":    e.DataId,
+		"data_type":  e.DataType,
+		"content":    e.Content,
+		"version":    e.Version,
 		"tags":       tags,
-		"created_at": entry.CreatedAt,
-		"updated_at": entry.UpdatedAt,
-	})
+		"created_at": e.CreatedAt,
+		"updated_at": e.UpdatedAt,
+	}
+}
+
+// handleWatch 处理长轮询（DESIGN §4.3）：挂起至条目 version 越过 v、被删除或超时。
+// 变更唤醒来自本机 FSM Apply（任意节点皆可挂起）；响应
+// active（含最新条目）/ deleted（含墓碑版本）/ timeout（回显 v 供原样重挂）。
+func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
+	if !s.ready() {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "restoring"})
+		return
+	}
+	ns, dataId := r.PathValue("ns"), r.PathValue("data_id")
+
+	v := int64(0)
+	if raw := r.URL.Query().Get("v"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			badRequest(w, fmt.Errorf("v 必须是非负整数，得到 %q", raw))
+			return
+		}
+		v = parsed
+	}
+	timeout := defaultWatchTimeout
+	if raw := r.URL.Query().Get("timeout"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			badRequest(w, fmt.Errorf("timeout 必须为正时长，得到 %q", raw))
+			return
+		}
+		timeout = d
+	}
+	if timeout > maxWatchTimeout {
+		timeout = maxWatchTimeout
+	}
+
+	// 先注册后检查：关闭"快路径判定与挂起之间错过通知"的竞态窗口。
+	release, events := s.hub.Register(ns, dataId)
+	defer release()
+
+	entry, err := s.store.GetEntry(r.Context(), ns, dataId)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+		return
+	}
+	if entry != nil {
+		if entry.Version > v {
+			writeJSON(w, http.StatusOK, map[string]any{"status": "active", "entry": entryJSON(entry)})
+			return
+		}
+	} else if cur, _, err := s.store.CurrentVersion(r.Context(), ns, dataId); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+		return
+	} else if cur > v {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "version": cur})
+		return
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		writeJSON(w, http.StatusOK, map[string]any{"status": "timeout", "version": v})
+	case ev := <-events:
+		if ev.Deleted {
+			writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "version": ev.Version})
+			return
+		}
+		// 唤醒后重读本机 PG：事件只携带版本，条目体以 Apply 后的最新态为准。
+		entry, err := s.store.GetEntry(r.Context(), ns, dataId)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+			return
+		}
+		if entry == nil {
+			// 事件后条目又被删除：以墓碑版本响应（版本单调，必越过 v）。
+			cur, _, err := s.store.CurrentVersion(r.Context(), ns, dataId)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "version": cur})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "active", "entry": entryJSON(entry)})
+	case <-r.Context().Done():
+		// 客户端断开，连接已收场，无从写响应。
+	}
 }
 
 // handleSnapshot 手动触发快照（DESIGN §4.4"达到阈值或手动触发"）；Leader 处理。

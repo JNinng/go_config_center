@@ -9,10 +9,12 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
 	"github.com/jninng/go_config_center/internal/testutil"
+	"github.com/jninng/go_config_center/internal/watch"
 )
 
 func mustStore(t *testing.T) *store.Store {
@@ -32,7 +34,7 @@ func mustStore(t *testing.T) *store.Store {
 func mustServer(t *testing.T, ready func() bool, snap func() (uint64, error)) (*Server, *store.Store, func()) {
 	t.Helper()
 	st := mustStore(t)
-	return New(nil, st, "tok", ready, snap), st, func() {}
+	return New(nil, st, nil, "tok", ready, snap), st, func() {}
 }
 
 // fakeProposer 以预置结果模拟 Raft 提案，用于端点语义映射测试。
@@ -155,7 +157,7 @@ func TestDeleteEndpoint(t *testing.T) {
 
 	do := func(t *testing.T, p Proposer, auth, url string) *http.Response {
 		t.Helper()
-		ts := httptest.NewServer(New(p, st, "tok", func() bool { return true }, nil).Routes())
+		ts := httptest.NewServer(New(p, st, watch.NewHub(), "tok", func() bool { return true }, nil).Routes())
 		defer ts.Close()
 		req, _ := http.NewRequest(http.MethodDelete, ts.URL+url, nil)
 		if auth != "" {
@@ -231,7 +233,7 @@ func TestVersionsEndpoint(t *testing.T) {
 		t.Fatalf("delete = %+v %v", res, err)
 	}
 
-	ts := httptest.NewServer(New(nil, st, "tok", func() bool { return true }, nil).Routes())
+	ts := httptest.NewServer(New(nil, st, nil, "tok", func() bool { return true }, nil).Routes())
 	defer ts.Close()
 
 	get := func(t *testing.T, query string) []map[string]any {
@@ -288,7 +290,7 @@ func TestRollbackEndpoint(t *testing.T) {
 
 	do := func(t *testing.T, p Proposer, auth, body string) *http.Response {
 		t.Helper()
-		ts := httptest.NewServer(New(p, st, "tok", func() bool { return true }, nil).Routes())
+		ts := httptest.NewServer(New(p, st, watch.NewHub(), "tok", func() bool { return true }, nil).Routes())
 		defer ts.Close()
 		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/namespaces/dev/configs/a/rollback", strings.NewReader(body))
 		if auth != "" {
@@ -341,5 +343,147 @@ func TestRollbackEndpoint(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("body %q = %d, want 400", bad, resp.StatusCode)
 		}
+	}
+}
+
+func watchGet(t *testing.T, base, query string) (int, map[string]any, time.Duration) {
+	t.Helper()
+	start := time.Now()
+	resp, err := http.Get(base + query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, body, elapsed
+}
+
+// Watch 长轮询快路径与超时（DESIGN §4.3）：
+// v 落后 → 立即返回当前状态；v 已是最新 → 挂起至 timeout，回显 v 供原样重挂。
+func TestWatchImmediateAndTimeout(t *testing.T) {
+	st := mustStore(t)
+	hub := watch.NewHub()
+	ts := httptest.NewServer(New(nil, st, hub, "tok", func() bool { return true }, nil).Routes())
+	defer ts.Close()
+	ctx := context.Background()
+	base := ts.URL + "/v1/namespaces/dev/configs/a/watch"
+
+	for i := 1; i <= 2; i++ {
+		if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: "a", DataType: "TEXT", Content: fmt.Sprintf("v%d", i)}, uint64(i), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, body, elapsed := watchGet(t, base, "?v=1&timeout=5s")
+	if code != http.StatusOK || body["status"] != "active" || elapsed > 2*time.Second {
+		t.Fatalf("v=1（落后）= %d %v %v, want 立即 active", code, body, elapsed)
+	}
+	entry := body["entry"].(map[string]any)
+	if entry["version"] != float64(2) || entry["content"] != "v2" {
+		t.Fatalf("entry = %v, want v2 条目", entry)
+	}
+
+	code, body, _ = watchGet(t, base, "?v=2&timeout=150ms")
+	if code != http.StatusOK || body["status"] != "timeout" || body["version"] != float64(2) {
+		t.Fatalf("v=2（最新）= %d %v, want timeout 回显 v2", code, body)
+	}
+
+	// 条目此刻删除（墓碑 v3），供后续 deleted 断言使用。
+	if res, err := st.ApplyDelete(ctx, raftlog.DeleteData{Namespace: "dev", DataId: "a"}, 3, 1); err != nil || res.Status != raftlog.StatusOK {
+		t.Fatalf("delete = %+v %v", res, err)
+	}
+
+	code, body, elapsed = watchGet(t, base, "?v=2&timeout=5s")
+	if code != http.StatusOK || body["status"] != "deleted" || body["version"] != float64(3) || elapsed > 2*time.Second {
+		t.Fatalf("v=2 墓碑 v3 = %d %v %v, want 立即 deleted version=3", code, body, elapsed)
+	}
+
+	// 从未存在的条目：挂起至超时（等待创建是合法场景）。
+	code, body, _ = watchGet(t, base, "?v=0&timeout=150ms")
+	_ = code
+	code, body, _ = watchGet(t, ts.URL+"/v1/namespaces/dev/configs/ghost/watch", "?v=0&timeout=150ms")
+	if code != http.StatusOK || body["status"] != "timeout" {
+		t.Fatalf("ghost = %d %v, want timeout", code, body)
+	}
+
+	for _, bad := range []string{"?v=abc", "?timeout=abc", "?timeout=0s", "?v=-1"} {
+		resp, err := http.Get(base + bad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s = %d, want 400", bad, resp.StatusCode)
+		}
+	}
+}
+
+// 验收：挂起期间 Publish/Delete 唤醒挂起连接，立即返回。
+func TestWatchWakeOnNotify(t *testing.T) {
+	st := mustStore(t)
+	hub := watch.NewHub()
+	ts := httptest.NewServer(New(nil, st, hub, "tok", func() bool { return true }, nil).Routes())
+	defer ts.Close()
+	ctx := context.Background()
+
+	watchCh := make(chan map[string]any, 1)
+	go func() {
+		resp, err := http.Get(ts.URL + "/v1/namespaces/dev/configs/a/watch?v=0&timeout=10s")
+		if err != nil {
+			close(watchCh)
+			return
+		}
+		defer resp.Body.Close()
+		var body map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		watchCh <- body
+	}()
+
+	// 等挂起连接完成快路径检查并注册，再模拟 FSM Apply 的唤醒。
+	time.Sleep(200 * time.Millisecond)
+	if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: "a", DataType: "TEXT", Content: "woken"}, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	hub.Notify("dev", "a", watch.Event{Version: 1})
+
+	select {
+	case body := <-watchCh:
+		if body == nil || body["status"] != "active" {
+			t.Fatalf("唤醒 = %v, want active", body)
+		}
+		entry := body["entry"].(map[string]any)
+		if entry["version"] != float64(1) || entry["content"] != "woken" {
+			t.Fatalf("entry = %v, want 唤醒后重读的最新条目", entry)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("挂起未在期限内被唤醒")
+	}
+}
+
+// 验收：客户端断连后 handler 及时退出，服务端不悬挂。
+func TestWatchClientDisconnectReleasesHandler(t *testing.T) {
+	st := mustStore(t)
+	hub := watch.NewHub()
+	ts := httptest.NewServer(New(nil, st, hub, "tok", func() bool { return true }, nil).Routes())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/namespaces/dev/configs/a/watch?v=0&timeout=60s", nil)
+	req = req.WithContext(ctx)
+	go http.DefaultClient.Do(req) // 取消即断连，响应无从读取
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	closed := make(chan struct{})
+	go func() {
+		ts.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("断连后 Server.Close 未及时完成：挂起 handler 悬挂")
 	}
 }

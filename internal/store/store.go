@@ -387,6 +387,28 @@ func finishRejected(ctx context.Context, tx pgx.Tx, committed *bool, index, term
 	return res, nil
 }
 
+// CurrentVersion 返回条目当前版本与存活标志：存活条目为 biz_configs.version，
+// 已删除为墓碑版本，从未存在为 (0, false)（DESIGN §3.1：墓碑延续同一版本序列）。
+func (s *Store) CurrentVersion(ctx context.Context, namespace, dataId string) (version int64, live bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT version FROM biz_configs WHERE namespace = $1 AND data_id = $2`,
+		namespace, dataId).Scan(&version)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		err = s.pool.QueryRow(ctx,
+			`SELECT COALESCE(MAX(version), 0) FROM biz_config_history
+			 WHERE namespace = $1 AND data_id = $2`,
+			namespace, dataId).Scan(&version)
+		if err != nil {
+			return 0, false, fmt.Errorf("读取 History 版本: %w", err)
+		}
+		return version, false, nil
+	case err != nil:
+		return 0, false, fmt.Errorf("读取当前版本: %w", err)
+	}
+	return version, true, nil
+}
+
 // DefaultHistoryLimit 与 MaxHistoryLimit 是 History 查询的默认与上限页大小（DESIGN §5.1）。
 const (
 	DefaultHistoryLimit = 50

@@ -24,6 +24,7 @@ import (
 	"github.com/jninng/go_config_center/internal/nodeid"
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
+	"github.com/jninng/go_config_center/internal/watch"
 )
 
 func main() {
@@ -82,7 +83,8 @@ func main() {
 		fatal(logger, "打开文件快照存储", err)
 	}
 
-	machine, err := fsm.New(ctx, st)
+	hub := watch.NewHub()
+	machine, err := fsm.New(ctx, st, hub)
 	if err != nil {
 		fatal(logger, "构造 FSM", err)
 	}
@@ -163,7 +165,7 @@ func main() {
 		_ = rc.Close()
 		return meta.Index, nil
 	}
-	mux := api.New(proposer, st, cfg.AdminToken, ready, snapshotTrigger).Routes()
+	mux := api.New(proposer, st, hub, cfg.AdminToken, ready, snapshotTrigger).Routes()
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)

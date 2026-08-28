@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
+	"github.com/jninng/go_config_center/internal/watch"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -59,6 +60,7 @@ var metrics = struct {
 // 串行调度，内部不加锁保护 Apply 路径；互斥锁只保护结果表的并发读（Result）。
 type FSM struct {
 	store *store.Store
+	hub   *watch.Hub
 	log   *slog.Logger
 
 	// serving 是 Serving 门闩（DESIGN §4.4）：全量恢复期间为 false，
@@ -72,14 +74,15 @@ type FSM struct {
 	resultKeep uint64
 }
 
-// New 构造 FSM 并从 raft_fsm_meta 恢复进度。
-func New(ctx context.Context, st *store.Store) (*FSM, error) {
+// New 构造 FSM 并从 raft_fsm_meta 恢复进度。hub 为本机 Watch 唤醒源（DESIGN §4.3），可为 nil。
+func New(ctx context.Context, st *store.Store, hub *watch.Hub) (*FSM, error) {
 	index, term, err := st.LoadMeta(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("恢复 FSM 进度: %w", err)
 	}
 	f := &FSM{
 		store:      st,
+		hub:        hub,
 		log:        slog.Default(),
 		lastIndex:  index,
 		lastTerm:   term,
@@ -131,6 +134,9 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		if err != nil {
 			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
 		}
+		if res.Status == raftlog.StatusOK {
+			f.notify(data.Namespace, data.DataId, watch.Event{Version: res.Version})
+		}
 		metrics.applyResults.WithLabelValues(string(res.Status)).Inc()
 		return res, raftlog.OpPublish
 
@@ -142,6 +148,9 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		res, err := f.store.ApplyDelete(context.Background(), data, l.Index, l.Term)
 		if err != nil {
 			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
+		}
+		if res.Status == raftlog.StatusOK {
+			f.notify(data.Namespace, data.DataId, watch.Event{Version: res.Version, Deleted: true})
 		}
 		metrics.applyResults.WithLabelValues(string(res.Status)).Inc()
 		return res, raftlog.OpDelete
@@ -155,12 +164,22 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		if err != nil {
 			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
 		}
+		if res.Status == raftlog.StatusOK {
+			f.notify(data.Namespace, data.DataId, watch.Event{Version: res.Version})
+		}
 		metrics.applyResults.WithLabelValues(string(res.Status)).Inc()
 		return res, raftlog.OpRollback
 
 	default:
 		// 未知 op：推进进度，避免毒日志卡死重放。
 		return f.advanceOnly(l, fmt.Errorf("op %q 尚未实现", cmd.Op), "op 尚未实现，仅推进进度"), cmd.Op
+	}
+}
+
+// notify 唤醒本机挂起的 Watch（DESIGN §4.3）；hub 为 nil 时（单测）跳过。
+func (f *FSM) notify(namespace, dataId string, ev watch.Event) {
+	if f.hub != nil {
+		f.hub.Notify(namespace, dataId, ev)
 	}
 }
 

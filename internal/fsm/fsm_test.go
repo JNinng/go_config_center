@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
 	"github.com/jninng/go_config_center/internal/testutil"
+	"github.com/jninng/go_config_center/internal/watch"
 )
 
 func mustFSM(t *testing.T) (*FSM, *store.Store, string) {
@@ -22,7 +24,7 @@ func mustFSM(t *testing.T) (*FSM, *store.Store, string) {
 		t.Fatalf("Migrate: %v", err)
 	}
 	t.Cleanup(st.Close)
-	f, err := New(context.Background(), st)
+	f, err := New(context.Background(), st, nil)
 	if err != nil {
 		t.Fatalf("fsm.New: %v", err)
 	}
@@ -132,7 +134,7 @@ func TestFSMRestartSkipsReplayedLogs(t *testing.T) {
 	apply(t, f1, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
 	apply(t, f1, publishLog(t, 2, 1, t.Name(), "a", "v2", nil))
 
-	f2, err := New(context.Background(), st)
+	f2, err := New(context.Background(), st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,5 +290,55 @@ func TestResultTableKeepsRecentEntries(t *testing.T) {
 	}
 	if res, ok := f.Result(6); !ok || res.Version != 6 {
 		t.Fatalf("index=6 应在结果表中: %v %v", res, ok)
+	}
+}
+
+// 验收：FSM Apply 到 Publish/Delete 时唤醒本机挂起的 Watch；未变更状态的日志不唤醒。
+func TestApplyNotifiesWatchHub(t *testing.T) {
+	dsn := testutil.NewDB(t, "gcc_fsm_test")
+	st, err := store.Open(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	hub := watch.NewHub()
+	f, err := New(context.Background(), st, hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release, events := hub.Register(t.Name(), "a")
+	defer release()
+
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+	select {
+	case ev := <-events:
+		if ev.Version != 1 || ev.Deleted {
+			t.Fatalf("publish 事件 = %+v, want v1 非删除", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("publish 后未唤醒 Watch")
+	}
+
+	apply(t, f, deleteLog(t, 2, 1, t.Name(), "a", nil))
+	select {
+	case ev := <-events:
+		if ev.Version != 2 || !ev.Deleted {
+			t.Fatalf("delete 事件 = %+v, want v2 删除", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("delete 后未唤醒 Watch")
+	}
+
+	// CAS 冲突不改变条目状态，不唤醒。
+	wrong := int64(99)
+	apply(t, f, publishLog(t, 3, 1, t.Name(), "a", "nope", &wrong))
+	select {
+	case ev := <-events:
+		t.Fatalf("冲突不应唤醒: %+v", ev)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
