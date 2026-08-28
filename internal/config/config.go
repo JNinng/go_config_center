@@ -5,14 +5,16 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Raft struct {
-	SnapshotThreshold uint64 `yaml:"snapshot_threshold"`
-	SnapshotRetention int    `yaml:"snapshot_retention"`
-	TrailingLogs      uint64 `yaml:"trailing_logs"`
+	SnapshotThreshold uint64        `yaml:"snapshot_threshold"`
+	SnapshotRetention int           `yaml:"snapshot_retention"`
+	TrailingLogs      uint64        `yaml:"trailing_logs"`
+	SnapshotInterval  time.Duration `yaml:"snapshot_interval"`
 }
 
 type Config struct {
@@ -58,6 +60,9 @@ func applyDefaults(c *Config) {
 	}
 	if c.Raft.TrailingLogs == 0 {
 		c.Raft.TrailingLogs = 10240
+	}
+	if c.Raft.SnapshotInterval == 0 {
+		c.Raft.SnapshotInterval = 120 * time.Second
 	}
 	// HTTP 通告地址供 307 重定向与 Join 响应使用：缺省按 raft_addr 的主机 +
 	// http_addr 的端口推导（同机部署即可用；跨机时显式配置）。

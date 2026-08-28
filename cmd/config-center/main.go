@@ -101,6 +101,7 @@ func main() {
 	raftCfg.LocalID = raft.ServerID(nodeID)
 	raftCfg.SnapshotThreshold = cfg.Raft.SnapshotThreshold
 	raftCfg.TrailingLogs = cfg.Raft.TrailingLogs
+	raftCfg.SnapshotInterval = cfg.Raft.SnapshotInterval
 	raftCfg.LogOutput = os.Stderr
 
 	hasState, err := raft.HasExistingState(boltStore, boltStore, snapStore)
