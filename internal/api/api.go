@@ -17,9 +17,10 @@ import (
 
 // 提案失败原因，由 Proposer 实现方返回，映射为 DESIGN §4.1 的响应语义。
 var (
-	ErrNoLeader       = errors.New("当前无 Leader（选举中或已失主）")
-	ErrRaftDown       = errors.New("Raft 已关闭")
-	ErrProposeTimeout = errors.New("提案未在期限内提交")
+	ErrNoLeader             = errors.New("当前无 Leader（选举中或已失主）")
+	ErrRaftDown             = errors.New("Raft 已关闭")
+	ErrProposeTimeout       = errors.New("提案未在期限内提交")
+	ErrNothingNewToSnapshot = errors.New("快照点之后没有新日志，无需快照")
 )
 
 // Proposer 将一条日志信封经 Raft 提交，等待该日志应用完成后取回结果（DESIGN §3.3）。
@@ -27,21 +28,26 @@ type Proposer interface {
 	Propose(ctx context.Context, cmd []byte) (raftlog.Result, error)
 }
 
+// SnapshotTrigger 手动触发 FSM 快照，返回快照点 index。
+type SnapshotTrigger func() (uint64, error)
+
 type Server struct {
 	proposer   Proposer
 	store      *store.Store
 	adminToken string
 	ready      func() bool
+	snapshot   SnapshotTrigger
 }
 
-func New(p Proposer, st *store.Store, adminToken string, ready func() bool) *Server {
-	return &Server{proposer: p, store: st, adminToken: adminToken, ready: ready}
+func New(p Proposer, st *store.Store, adminToken string, ready func() bool, snapshot SnapshotTrigger) *Server {
+	return &Server{proposer: p, store: st, adminToken: adminToken, ready: ready, snapshot: snapshot}
 }
 
 func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/namespaces/{ns}/configs/{data_id}", s.handlePublish)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}", s.handleGet)
+	mux.HandleFunc("POST /v1/cluster/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.Handler())
@@ -118,7 +124,13 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGet 读当前条目（本机 PG，允许陈旧；DESIGN §5.1）。
+// Serving 门闩关闭（全量恢复中）时 503 + Retry-After（DESIGN §4.4）。
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	if !s.ready() {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "restoring"})
+		return
+	}
 	entry, err := s.store.GetEntry(r.Context(), r.PathValue("ns"), r.PathValue("data_id"))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
@@ -142,6 +154,30 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		"created_at": entry.CreatedAt,
 		"updated_at": entry.UpdatedAt,
 	})
+}
+
+// handleSnapshot 手动触发快照（DESIGN §4.4"达到阈值或手动触发"）；Leader 处理。
+func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if s.snapshot == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "snapshot_disabled"})
+		return
+	}
+	index, err := s.snapshot()
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "snapshot_index": index})
+	case errors.Is(err, ErrNothingNewToSnapshot):
+		writeJSON(w, http.StatusOK, map[string]any{"status": "noop"})
+	case errors.Is(err, ErrNoLeader), errors.Is(err, ErrRaftDown):
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_leader"})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "snapshot_failed", "message": err.Error()})
+	}
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

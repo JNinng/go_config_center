@@ -32,7 +32,10 @@ func main() {
 		bootstrap  = flag.Bool("bootstrap", false, "将空数据目录初始化为单节点新集群，仅首节点执行一次（ADR-0008）")
 	)
 	flag.Parse()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	// raft-boltdb 对已完成读事务的惯用回滚会经 stdlib log 打 "Rollback failed: tx closed"，
+	// 属上游良性噪音，定向丢弃。
+	base := slog.NewTextHandler(os.Stderr, nil)
+	logger := slog.New(noiseFilter{base})
 	slog.SetDefault(logger)
 
 	cfg, err := config.Load(*configPath)
@@ -58,7 +61,7 @@ func main() {
 	}
 
 	raftDir := filepath.Join(cfg.DataDir, "raft")
-	if err := os.MkdirAll(filepath.Join(raftDir, "snapshots"), 0o755); err != nil {
+	if err := os.MkdirAll(raftDir, 0o755); err != nil {
 		fatal(logger, "创建 raft 目录", err)
 	}
 
@@ -74,7 +77,7 @@ func main() {
 	if err != nil {
 		fatal(logger, "打开 boltdb 日志存储", err)
 	}
-	snapStore, err := raft.NewFileSnapshotStore(filepath.Join(raftDir, "snapshots"), cfg.Raft.SnapshotRetention, os.Stderr)
+	snapStore, err := raft.NewFileSnapshotStore(raftDir, cfg.Raft.SnapshotRetention, os.Stderr)
 	if err != nil {
 		fatal(logger, "打开文件快照存储", err)
 	}
@@ -137,8 +140,30 @@ func main() {
 	}()
 
 	proposer := &raftProposer{raft: r}
-	ready := func() bool { return r.State() != raft.Shutdown }
-	mux := api.New(proposer, st, cfg.AdminToken, ready).Routes()
+	// /readyz 与读 API 的 Serving 判定：门闩（全量恢复中为 false）且 Raft 非 Shutdown。
+	ready := func() bool { return machine.Serving() && r.State() != raft.Shutdown }
+	snapshotTrigger := func() (uint64, error) {
+		f := r.Snapshot()
+		if err := f.Error(); err != nil {
+			switch {
+			case errors.Is(err, raft.ErrNothingNewToSnapshot):
+				return 0, api.ErrNothingNewToSnapshot
+			case errors.Is(err, raft.ErrNotLeader), errors.Is(err, raft.ErrLeadershipLost):
+				return 0, api.ErrNoLeader
+			case errors.Is(err, raft.ErrRaftShutdown):
+				return 0, api.ErrRaftDown
+			default:
+				return 0, fmt.Errorf("触发快照失败: %w", err)
+			}
+		}
+		meta, rc, err := f.Open()
+		if err != nil {
+			return 0, fmt.Errorf("读取快照元信息: %w", err)
+		}
+		_ = rc.Close()
+		return meta.Index, nil
+	}
+	mux := api.New(proposer, st, cfg.AdminToken, ready, snapshotTrigger).Routes()
 
 	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
@@ -198,4 +223,26 @@ func (p *raftProposer) Propose(ctx context.Context, cmd []byte) (raftlog.Result,
 func fatal(logger *slog.Logger, msg string, err error) {
 	logger.Error(msg, "err", err)
 	os.Exit(1)
+}
+
+// noiseFilter 丢弃已知上游良性日志，其余透传。
+type noiseFilter struct{ next slog.Handler }
+
+func (f noiseFilter) Enabled(ctx context.Context, level slog.Level) bool {
+	return f.next.Enabled(ctx, level)
+}
+
+func (f noiseFilter) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == "Rollback failed: tx closed" {
+		return nil
+	}
+	return f.next.Handle(ctx, r)
+}
+
+func (f noiseFilter) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return noiseFilter{f.next.WithAttrs(attrs)}
+}
+
+func (f noiseFilter) WithGroup(name string) slog.Handler {
+	return noiseFilter{f.next.WithGroup(name)}
 }

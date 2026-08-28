@@ -149,7 +149,8 @@ func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, index, 
 	if err != nil {
 		return raftlog.Result{}, fmt.Errorf("开启事务: %w", err)
 	}
-	defer tx.Rollback(tctx) //nolint:errcheck // 提交后回滚是 no-op
+	committed := false
+	defer RollbackUnlessCommitted(tctx, tx, &committed)()
 
 	// 当前版本：存活条目优先；行不存在（从未创建或已删除）时取 History 最大版本，
 	// 墓碑延续同一版本序列（DESIGN §3.1）。
@@ -190,6 +191,7 @@ func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, index, 
 			if err := tx.Commit(tctx); err != nil {
 				return raftlog.Result{}, fmt.Errorf("提交（冲突路径）: %w", err)
 			}
+			committed = true
 			return raftlog.Conflict(current), nil
 		}
 	}
@@ -226,6 +228,7 @@ func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, index, 
 	if err := tx.Commit(tctx); err != nil {
 		return raftlog.Result{}, fmt.Errorf("提交: %w", err)
 	}
+	committed = true
 	return raftlog.OK(version, !live), nil
 }
 
@@ -238,14 +241,26 @@ func (s *Store) AdvanceMeta(ctx context.Context, index, term uint64) error {
 	if err != nil {
 		return fmt.Errorf("开启事务: %w", err)
 	}
-	defer tx.Rollback(tctx) //nolint:errcheck
+	committed := false
+	defer RollbackUnlessCommitted(tctx, tx, &committed)()
 	if err := advanceMeta(tctx, tx, index, term); err != nil {
 		return err
 	}
 	if err := tx.Commit(tctx); err != nil {
 		return fmt.Errorf("提交: %w", err)
 	}
+	committed = true
 	return nil
+}
+
+// RollbackUnlessCommitted 返回一个可 defer 的守卫：事务提交成功（*committed 置 true）
+// 后不再回滚，避免对已关闭事务的无效回滚。
+func RollbackUnlessCommitted(ctx context.Context, tx pgx.Tx, committed *bool) func() {
+	return func() {
+		if !*committed {
+			_ = tx.Rollback(ctx)
+		}
+	}
 }
 
 // advanceMeta 在当前事务内推进 raft_fsm_meta，保证三表进度恒一致。

@@ -4,9 +4,9 @@ package fsm
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -20,9 +20,12 @@ import (
 const defaultResultKeep = 4096
 
 var metrics = struct {
-	applyDuration *prometheus.HistogramVec
-	applyResults  *prometheus.CounterVec
-	lastApplied   prometheus.Gauge
+	applyDuration    *prometheus.HistogramVec
+	applyResults     *prometheus.CounterVec
+	lastApplied      prometheus.Gauge
+	snapshotDuration prometheus.Histogram
+	snapshotSize     prometheus.Gauge
+	restoreSkipped   prometheus.Counter
 }{
 	applyDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "fsm_apply_duration_seconds",
@@ -37,6 +40,19 @@ var metrics = struct {
 		Name: "fsm_last_applied_index",
 		Help: "FSM 已应用的 Raft 日志 index",
 	}),
+	snapshotDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "snapshot_duration_seconds",
+		Help:    "快照生成耗时（导出到写入快照存储）",
+		Buckets: prometheus.ExponentialBuckets(0.005, 2, 16),
+	}),
+	snapshotSize: promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "snapshot_size_bytes",
+		Help: "最近一次快照数据体字节数",
+	}),
+	restoreSkipped: promauto.NewCounter(prometheus.CounterOpts{
+		Name: "restore_skipped_total",
+		Help: "跳过式恢复命中次数（冷重启未触发全量导入）",
+	}),
 }
 
 // FSM 是 hashicorp/raft 的 FSM 实现。Apply/Snapshot/Restore 由 Raft 单 goroutine
@@ -44,6 +60,10 @@ var metrics = struct {
 type FSM struct {
 	store *store.Store
 	log   *slog.Logger
+
+	// serving 是 Serving 门闩（DESIGN §4.4）：全量恢复期间为 false，
+	// 读 API 返回 503 + Retry-After，/readyz 为 not ready。
+	serving atomic.Bool
 
 	mu         sync.Mutex
 	lastIndex  uint64
@@ -58,14 +78,16 @@ func New(ctx context.Context, st *store.Store) (*FSM, error) {
 	if err != nil {
 		return nil, fmt.Errorf("恢复 FSM 进度: %w", err)
 	}
-	return &FSM{
+	f := &FSM{
 		store:      st,
 		log:        slog.Default(),
 		lastIndex:  index,
 		lastTerm:   term,
 		results:    make(map[uint64]raftlog.Result),
 		resultKeep: defaultResultKeep,
-	}, nil
+	}
+	f.serving.Store(true)
+	return f, nil
 }
 
 // Apply 应用一条已提交日志，返回 raftlog.Result 经 ApplyFuture 回传给 API 层。
@@ -155,12 +177,4 @@ func (f *FSM) LastApplied() (index, term uint64) {
 	return f.lastIndex, f.lastTerm
 }
 
-// Snapshot 票 02 实现单事务导出；本票测试不会触达（snapshot_threshold=10000）。
-func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
-	return nil, fmt.Errorf("FSM 快照尚未实现（票 02）")
-}
-
-// Restore 票 02 实现跳过式恢复。
-func (f *FSM) Restore(rc io.ReadCloser) error {
-	return fmt.Errorf("FSM Restore 尚未实现（票 02）")
-}
+// Snapshot 与 Restore 见 snapshot.go（DESIGN §4.4）。

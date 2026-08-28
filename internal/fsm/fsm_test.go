@@ -146,17 +146,6 @@ func TestApplyPanicsWhenStoreUnavailable(t *testing.T) {
 	f.Apply(publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
 }
 
-// 本票允许快照未实现（票 02 落地），但必须显式报错。
-func TestSnapshotAndRestoreNotImplemented(t *testing.T) {
-	f, _, _ := mustFSM(t)
-	if _, err := f.Snapshot(); err == nil {
-		t.Fatal("Snapshot 应返回未实现错误")
-	}
-	if err := f.Restore(nil); err == nil {
-		t.Fatal("Restore 应返回未实现错误")
-	}
-}
-
 // 结果表仅保留近期条目（DESIGN §3.3）。
 func TestResultTableKeepsRecentEntries(t *testing.T) {
 	f, _, _ := mustFSM(t)

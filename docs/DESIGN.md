@@ -152,14 +152,15 @@ Expected Version（CAS）规则，`expected_version` 省略时为 LWW（最后�
 [magic 8B "GCCSNP01"][JSON 头一行][数据体]
 ```
 
-头：`{format_version, raft_index, raft_term, tables: {biz_configs: n1, biz_config_history: n2}, checksum}`。数据体为三表（含 `raft_fsm_meta`）的 PG `COPY` 文本流。
+头：`{format_version, raft_index, raft_term, tables: {<表名>: {rows, bytes}}, checksum}`。`checksum` 为数据体 sha256；数据体为三表（含 `raft_fsm_meta`）按固定表序排列的 PG `COPY TO STDOUT` 文本流，各分节以头中声明的字节长度分界（分节内容含 COPY 结束标记）。
 
 **生成**（`FSM.Snapshot`）：单个 REPEATABLE READ 事务导出三表，导出事务内读到的 `last_applied_index/term` 即快照点。达到 `snapshot_threshold` 条日志或手动触发。
 
 **恢复**（`FSM.Restore`）——Restore 在每次重启与 InstallSnapshot 时都会触发，必须满足：
 
 1. 校验 magic/格式版本/checksum，不符即失败（触发全量路径，见下）。
-2. 读头中 `raft_index`，与本机 `raft_fsm_meta.last_applied_index` 比对：**本机已追平或超前 → 跳过数据导入**，仅推进 Raft 内部状态。这是冷重启 ≤10s 的依据。
+2. 读头中 `raft_index`，与本机 `raft_fsm_meta.last_applied_index`（FSM 启动时装载、
+   随 Apply/Restore 同步推进的内存进度）比对：**本机已追平或超前 → 跳过数据导入**，仅推进 Raft 内部状态。这是冷重启 ≤10s 的依据。
 3. 否则全量导入：置本机 Serving 门闩为 false → 单事务 TRUNCATE 三表 + COPY 导入 → 更新内存 Raft 状态 → 门闩恢复 true。
 
 Serving 门闩为进程内原子布尔；false 期间所有读 API 返回 **503 + Retry-After**，`/readyz` 为 not ready。
@@ -200,6 +201,7 @@ Namespace 隐式创建（首次 Publish 即生效），无独立管理接口。
 |---|---|
 | `GET /v1/cluster/status` | 本节点视角：`{node_id, role, term, leader_id, leader_addr, last_applied_index, restoring, members: [{node_id, addr, role, suffrage}]}`。任意节点可调 |
 | `POST /v1/cluster/join` | body `{node_id, raft_addr}`。202 已受理；幂等 200 |
+| `POST /v1/cluster/snapshot` | 手动触发 FSM 快照（§4.4"达到阈值或手动触发"）。200 `{status:"ok", snapshot_index}`；空 FSM 再触发 200 `{status:"noop"}` |
 | `DELETE /v1/cluster/peers/{node_id}` | 移除成员。200；409 护栏拒绝；404 非成员 |
 
 ### 5.3 内部接口（仅供发现代理，不认证）
