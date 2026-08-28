@@ -192,7 +192,10 @@ func main() {
 	ready := func() bool { return machine.Serving() && r.State() != raft.Shutdown }
 
 	// 集群视角：Leader HTTP 地址缓存放行 307 重定向；本节点为 Leader 时即自身通告地址。
-	var leaderHTTPCache atomic.Value
+	// 缓存绑定到获知时的 Leader Raft 地址——Leader 更换后立即失效为 503（而非
+	// 重定向到已下线的旧 Leader），待发现代理刷新后恢复 307。
+	var leaderHTTPCache atomic.Value    // string
+	var cachedForLeader atomic.Value    // string
 	clusterInfo := func() api.ClusterInfo {
 		role := strings.ToLower(r.State().String())
 		leaderAddr, leaderID := r.LeaderWithID()
@@ -201,7 +204,9 @@ func main() {
 		if role == "leader" {
 			httpAddr = cfg.HTTPAdvertise
 		} else if v, ok := leaderHTTPCache.Load().(string); ok {
-			httpAddr = v
+			if ref, ok2 := cachedForLeader.Load().(string); ok2 && ref == string(leaderAddr) {
+				httpAddr = v
+			}
 		}
 		lastApplied, _ := machine.LastApplied()
 		return api.ClusterInfo{
@@ -349,7 +354,13 @@ func main() {
 			HTTPAdvertise: cfg.HTTPAdvertise,
 			Seeds:         seeds,
 			AdminToken:    cfg.AdminToken,
-			OnLeader:      func(addr string) { leaderHTTPCache.Store(addr) },
+			OnLeader: func(raftAddr, httpAddr string) {
+				if raftAddr == "" || httpAddr == "" {
+					return
+				}
+				leaderHTTPCache.Store(httpAddr)
+				cachedForLeader.Store(raftAddr)
+			},
 		}, hasState)
 	}
 

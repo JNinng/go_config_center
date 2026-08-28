@@ -47,7 +47,7 @@ func TestRunJoinsThroughLeaderSeed(t *testing.T) {
 		Seeds:         []string{leaderTS.URL},
 		AdminToken:    "tok",
 		RefreshPeriod: 100 * time.Millisecond,
-		OnLeader:      func(addr string) { onLeader <- addr },
+		OnLeader:      func(_, addr string) { onLeader <- addr },
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -97,7 +97,7 @@ func TestRunJoinsViaFollowerCache(t *testing.T) {
 		NodeID: "n2", RaftAddr: "127.0.0.1:7947", HTTPAdvertise: "http://127.0.0.1:8081",
 		Seeds: []string{followerTS.URL}, AdminToken: "tok",
 		RefreshPeriod: 100 * time.Millisecond,
-		OnLeader: func(addr string) {
+		OnLeader: func(_, addr string) {
 			select {
 			case onLeader <- addr:
 			default:

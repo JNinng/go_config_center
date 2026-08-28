@@ -20,7 +20,7 @@ const (
 	scanTimeout    = 2 * time.Second
 	joinTimeout    = 10 * time.Second
 	maxBackoff     = 30 * time.Second
-	defaultRefresh = 15 * time.Second
+	defaultRefresh = 5 * time.Second
 )
 
 // Options 是发现代理的运行参数。
@@ -32,8 +32,9 @@ type Options struct {
 	AdminToken    string
 	// RefreshPeriod 是加入成功后跟踪 Leader 地址的刷新周期，缺省 15s（测试可缩短）。
 	RefreshPeriod time.Duration
-	// OnLeader 在本节点获知 Leader 的 HTTP 地址时被调用（含加入成功后与刷新期间）。
-	OnLeader func(leaderHTTPAddr string)
+	// OnLeader 在本节点获知 Leader 地址时被调用（含加入成功后与刷新期间）。
+	// raftAddr 供调用方校验缓存新鲜度（Leader 更换后旧 HTTP 地址立即失效）。
+	OnLeader func(leaderRaftAddr, leaderHTTPAddr string)
 }
 
 type discoveryInfo struct {
@@ -64,10 +65,10 @@ func Run(ctx context.Context, log *slog.Logger, opts Options, alreadyMember bool
 		if ctx.Err() != nil {
 			return
 		}
-		leaderHTTP, found := scanAndJoin(ctx, log, client, opts, joined)
+		leaderRaft, leaderHTTP, found := scanAndJoin(ctx, log, client, opts, joined)
 		if found {
 			if opts.OnLeader != nil {
-				opts.OnLeader(leaderHTTP)
+				opts.OnLeader(leaderRaft, leaderHTTP)
 			}
 			if !joined {
 				joined = true
@@ -92,8 +93,8 @@ func Run(ctx context.Context, log *slog.Logger, opts Options, alreadyMember bool
 }
 
 // scanAndJoin 扫描 seeds：发现 Leader（或经 Follower 缓存得知 Leader 地址）时
-// 尝试 Join，返回 Leader HTTP 地址。joined=true 时只做地址跟踪，不再发 Join。
-func scanAndJoin(ctx context.Context, log *slog.Logger, client *http.Client, opts Options, joined bool) (string, bool) {
+// 尝试 Join，返回 Leader 的 Raft/HTTP 地址。joined=true 时只做地址跟踪，不再发 Join。
+func scanAndJoin(ctx context.Context, log *slog.Logger, client *http.Client, opts Options, joined bool) (string, string, bool) {
 	for _, seed := range opts.Seeds {
 		if isSelfAddr(seed, opts.HTTPAdvertise, opts.RaftAddr) {
 			continue
@@ -103,29 +104,26 @@ func scanAndJoin(ctx context.Context, log *slog.Logger, client *http.Client, opt
 			log.Debug("Seed 不可达", "seed", seed, "err", err)
 			continue
 		}
-		candidates := make([]string, 0, 2)
-		switch {
-		case info.Role == "leader" && info.LeaderHTTPAddr != "":
-			candidates = append(candidates, info.LeaderHTTPAddr)
-		case info.Role == "follower" && info.LeaderHTTPAddr != "":
-			// 对方为 Follower：从其缓存取 Leader HTTP 地址再试（DESIGN §4.5）。
-			candidates = append(candidates, info.LeaderHTTPAddr)
+		if info.LeaderHTTPAddr == "" || info.LeaderAddr == "" {
+			continue
 		}
-		for _, leaderHTTP := range candidates {
-			if opts.OnLeader != nil {
-				opts.OnLeader(leaderHTTP)
-			}
-			if joined {
-				return leaderHTTP, true
-			}
-			if err := sendJoin(ctx, client, opts, leaderHTTP); err != nil {
-				log.Warn("Join 失败", "leader", leaderHTTP, "err", err)
-				continue
-			}
-			return leaderHTTP, true
+		if info.Role != "leader" && info.Role != "follower" {
+			continue
 		}
+		// Leader seed 直接 Join；Follower seed 从其缓存取 Leader HTTP 地址再试（DESIGN §4.5）。
+		if opts.OnLeader != nil {
+			opts.OnLeader(info.LeaderAddr, info.LeaderHTTPAddr)
+		}
+		if joined {
+			return info.LeaderAddr, info.LeaderHTTPAddr, true
+		}
+		if err := sendJoin(ctx, client, opts, info.LeaderHTTPAddr); err != nil {
+			log.Warn("Join 失败", "leader", info.LeaderHTTPAddr, "err", err)
+			continue
+		}
+		return info.LeaderAddr, info.LeaderHTTPAddr, true
 	}
-	return "", false
+	return "", "", false
 }
 
 // fetchDiscovery 调用对端 /internal/discovery。
