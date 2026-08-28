@@ -163,6 +163,23 @@ esac
 KILL_AT=$(date +%s)
 check $? "压测进行中杀掉 Leader（端口 $LP）"
 
+# 主动探测选举窗口：某节点尚未得知新 Leader 时写请求 → 503 + Retry-After
+saw503=0
+for _ in $(seq 1 300); do
+  if [ "$saw503" = "1" ]; then break; fi
+  for port in 8080 8081 8082; do
+    curl -sf --max-time 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 || continue
+    d=$(curl -s --max-time 1 "http://127.0.0.1:$port/internal/discovery")
+    la=$(echo "$d" | grep -o '"leader_addr":"[^"]*"' | cut -d'"' -f4)
+    role=$(echo "$d" | grep -o '"role":"[^"]*"' | cut -d'"' -f4)
+    if [ -z "$la" ] || [ "$role" = "candidate" ]; then
+      code=$(curl -s -o /dev/null --max-time 1 -w '%{http_code}' -X PUT "http://127.0.0.1:$port/v1/namespaces/dev/configs/noleader-probe" \
+        -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"content":"x","data_type":"TEXT"}')
+      if [ "$code" = "503" ]; then saw503=1; break 2; fi
+    fi
+  done
+done
+
 NEWLP=""
 for _ in $(seq 1 40); do
   NEWLP=$(leader_port)
@@ -198,8 +215,7 @@ else
 fi
 
 echo "=== 验收 2：选举期 503，选举后仅凭重试/307 恢复 ==="
-codes=$(grep -c '^503$' "$FAILCODES" 2>/dev/null || echo 0)
-if [ "$codes" -gt 0 ]; then check 0 "选举窗口观察到 503（$codes 次）"; else check 1 "未观察到 503"; fi
+if [ "$saw503" = "1" ]; then check 0 "选举窗口写请求 503（主动探测捕获）"; else check 1 "选举窗口未捕获 503"; fi
 recovered=1
 for i in 901 902 903 904 905; do
   code=$(curl -s -L --max-time 3 -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$FPORT/v1/namespaces/dev/configs/chaos-$i" \

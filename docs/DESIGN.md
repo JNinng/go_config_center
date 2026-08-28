@@ -307,16 +307,16 @@ config-center --config config.yaml
 - **DoD**：幂等性属性测试通过；空库启动 ≤3s 断言；单节点全 API 集成测试（已完成，见 .scratch/config-center-mvp/issues/01~07 验收记录）
 
 ### Phase 2 — 集群
-- [ ] 发现代理（Seed 扫描 + 退避重试）与 Join API
-- [ ] 307/503 写重定向语义
-- [ ] 成员移除 + quorum 护栏 + 被移除节点自退出（码 42）
-- [ ] /v1/cluster/status
+- [x] 发现代理（Seed 扫描 + 退避重试）与 Join API
+- [x] 307/503 写重定向语义
+- [x] 成员移除 + quorum 护栏 + 被移除节点自退出（码 42）
+- [x] /v1/cluster/status
 - **DoD**：§8.2 前四项混沌场景通过
 
 ### Phase 3 — 快照与规模化
-- [ ] 快照保留清理（retention/trailing_logs 生效）
-- [ ] InstallSnapshot → Restore 全链路场景
-- [ ] 10 万条数据量下：快照生成、落后节点恢复、冷重启时间
+- [x] 快照保留清理（retention/trailing_logs 生效）
+- [x] InstallSnapshot → Restore 全链路场景
+- [x] 10 万条数据量下：快照生成、落后节点恢复、冷重启时间
 - **DoD**：§8.2 全部场景 + §8.3 全部断言通过
 
 ## 10. 技术栈
