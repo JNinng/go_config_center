@@ -232,6 +232,131 @@ func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, index, 
 	return raftlog.OK(version, !live), nil
 }
 
+// ApplyDelete 在单个 PG 事务内完成 op=delete（DESIGN §4.2）：删除 biz_configs 行 +
+// 追加 content 为 NULL 的 Tombstone（ADR-0010，版本号照常消耗）+ 推进 raft_fsm_meta。
+// 条目不存在或已删除返回 not_found（无物可删）；CAS 不匹配返回 conflict——
+// 二者都是已提交日志，进度同事务推进，不追加 History。
+func (s *Store) ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, term uint64) (raftlog.Result, error) {
+	tctx, cancel := context.WithTimeout(ctx, applyTimeout)
+	defer cancel()
+
+	tx, err := s.pool.Begin(tctx)
+	if err != nil {
+		return raftlog.Result{}, fmt.Errorf("开启事务: %w", err)
+	}
+	committed := false
+	defer RollbackUnlessCommitted(tctx, tx, &committed)()
+
+	var current int64
+	err = tx.QueryRow(tctx,
+		`SELECT version FROM biz_configs WHERE namespace = $1 AND data_id = $2`,
+		d.Namespace, d.DataId).Scan(&current)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if err := advanceMeta(tctx, tx, index, term); err != nil {
+			return raftlog.Result{}, err
+		}
+		if err := tx.Commit(tctx); err != nil {
+			return raftlog.Result{}, fmt.Errorf("提交（无条目路径）: %w", err)
+		}
+		committed = true
+		return raftlog.Result{Status: raftlog.StatusNotFound}, nil
+	case err != nil:
+		return raftlog.Result{}, fmt.Errorf("读取当前版本: %w", err)
+	}
+
+	// CAS（DESIGN §4.1）：省略恒通过；0 = create-if-absent，与删除互斥——
+	// 走到这里条目必然存活，恒冲突；N>0 = 当前版本恰为 N。
+	if d.ExpectedVersion != nil && (*d.ExpectedVersion == 0 || current != *d.ExpectedVersion) {
+		if err := advanceMeta(tctx, tx, index, term); err != nil {
+			return raftlog.Result{}, err
+		}
+		if err := tx.Commit(tctx); err != nil {
+			return raftlog.Result{}, fmt.Errorf("提交（冲突路径）: %w", err)
+		}
+		committed = true
+		return raftlog.Conflict(current), nil
+	}
+
+	if _, err = tx.Exec(tctx,
+		`DELETE FROM biz_configs WHERE namespace = $1 AND data_id = $2`,
+		d.Namespace, d.DataId); err != nil {
+		return raftlog.Result{}, fmt.Errorf("删除 biz_configs: %w", err)
+	}
+	if _, err = tx.Exec(tctx, `
+		INSERT INTO biz_config_history (namespace, data_id, version, op, actor)
+		VALUES ($1, $2, $3, 'delete', $4)`,
+		d.Namespace, d.DataId, current+1, d.Actor); err != nil {
+		return raftlog.Result{}, fmt.Errorf("追加 Tombstone: %w", err)
+	}
+
+	if err := advanceMeta(tctx, tx, index, term); err != nil {
+		return raftlog.Result{}, err
+	}
+	if err := tx.Commit(tctx); err != nil {
+		return raftlog.Result{}, fmt.Errorf("提交: %w", err)
+	}
+	committed = true
+	return raftlog.OK(current+1, false), nil
+}
+
+// DefaultHistoryLimit 与 MaxHistoryLimit 是 History 查询的默认与上限页大小（DESIGN §5.1）。
+const (
+	DefaultHistoryLimit = 50
+	MaxHistoryLimit     = 1000
+)
+
+// HistoryRecord 是 History 中的一条不可变版本记录；DataType/Content 为 nil 即 Tombstone。
+type HistoryRecord struct {
+	Version   int64
+	Op        string
+	DataType  *string
+	Content   *string
+	Tags      map[string]string
+	Actor     *string
+	CreatedAt time.Time
+}
+
+// ListHistory 按 version 倒序分页返回 History（DESIGN §5.1），含 Tombstone 记录。
+// beforeVersion 非 nil 时仅返回 version 小于它的记录；limit ≤0 取默认值，超过上限收敛。
+func (s *Store) ListHistory(ctx context.Context, namespace, dataId string, limit int, beforeVersion *int64) ([]HistoryRecord, error) {
+	if limit <= 0 {
+		limit = DefaultHistoryLimit
+	}
+	if limit > MaxHistoryLimit {
+		limit = MaxHistoryLimit
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT version, op, data_type, content, tags, actor, created_at
+		FROM biz_config_history
+		WHERE namespace = $1 AND data_id = $2 AND ($3::bigint IS NULL OR version < $3)
+		ORDER BY version DESC
+		LIMIT $4`, namespace, dataId, beforeVersion, limit)
+	if err != nil {
+		return nil, fmt.Errorf("查询 History: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]HistoryRecord, 0)
+	for rows.Next() {
+		var r HistoryRecord
+		var tags []byte
+		if err := rows.Scan(&r.Version, &r.Op, &r.DataType, &r.Content, &tags, &r.Actor, &r.CreatedAt); err != nil {
+			return nil, fmt.Errorf("读取 History 记录: %w", err)
+		}
+		if tags != nil {
+			if err := json.Unmarshal(tags, &r.Tags); err != nil {
+				return nil, fmt.Errorf("解析 tags: %w", err)
+			}
+		}
+		records = append(records, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历 History: %w", err)
+	}
+	return records, nil
+}
+
 // AdvanceMeta 仅推进 raft_fsm_meta，用于信封损坏或 op 未实现但日志已提交的场景，
 // 保证 last_applied_index 无空洞。
 func (s *Store) AdvanceMeta(ctx context.Context, index, term uint64) error {

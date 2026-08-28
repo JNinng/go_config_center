@@ -6,7 +6,9 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,6 +49,8 @@ func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/namespaces/{ns}/configs/{data_id}", s.handlePublish)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}", s.handleGet)
+	mux.HandleFunc("DELETE /v1/namespaces/{ns}/configs/{data_id}", s.handleDelete)
+	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/versions", s.handleVersions)
 	mux.HandleFunc("POST /v1/cluster/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
@@ -96,18 +100,8 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.proposer.Propose(r.Context(), b)
-	switch {
-	case errors.Is(err, ErrNoLeader), errors.Is(err, ErrRaftDown):
-		// DESIGN §4.1：无 Leader 时 503 + Retry-After（307 重定向属后续票）。
-		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_leader"})
-		return
-	case errors.Is(err, ErrProposeTimeout):
-		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"error": "propose_timeout"})
-		return
-	case err != nil:
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "propose_failed", "message": err.Error()})
+	res, ok := s.propose(w, r, b)
+	if !ok {
 		return
 	}
 
@@ -121,6 +115,124 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
 	}
+}
+
+// propose 将命令提交 Raft 并等待该日志 Apply 完成；提案层失败（无 Leader、超时等）
+// 直接写响应并返回 false（DESIGN §4.1）。
+func (s *Server) propose(w http.ResponseWriter, r *http.Request, cmd []byte) (raftlog.Result, bool) {
+	res, err := s.proposer.Propose(r.Context(), cmd)
+	switch {
+	case errors.Is(err, ErrNoLeader), errors.Is(err, ErrRaftDown):
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_leader"})
+		return raftlog.Result{}, false
+	case errors.Is(err, ErrProposeTimeout):
+		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"error": "propose_timeout"})
+		return raftlog.Result{}, false
+	case err != nil:
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "propose_failed", "message": err.Error()})
+		return raftlog.Result{}, false
+	}
+	return res, true
+}
+
+// handleDelete 处理删除（DESIGN §4.2/§5.1）：删除条目并写 Tombstone，版本号照常消耗。
+// 404 = 条目不存在或已删除；409 = CAS 不匹配 + 当前版本。
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	var expected *int64
+	if raw := r.URL.Query().Get("expected_version"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			badRequest(w, fmt.Errorf("expected_version 必须是非负整数，得到 %q", raw))
+			return
+		}
+		expected = &v
+	}
+
+	cmd, err := raftlog.NewDelete(raftlog.DeleteData{
+		Namespace:       r.PathValue("ns"),
+		DataId:          r.PathValue("data_id"),
+		ExpectedVersion: expected,
+		Actor:           "admin",
+	})
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+	b, err := raftlog.Encode(cmd)
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+
+	res, ok := s.propose(w, r, b)
+	if !ok {
+		return
+	}
+	switch res.Status {
+	case raftlog.StatusOK:
+		writeJSON(w, http.StatusOK, map[string]any{"version": res.Version, "status": "deleted"})
+	case raftlog.StatusVersionConflict:
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "version_conflict", "current_version": res.CurrentVersion})
+	case raftlog.StatusNotFound:
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
+	}
+}
+
+// handleVersions 返回 History 倒序分页（DESIGN §5.1），读本机 PG，含 Tombstone 记录。
+func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
+	if !s.ready() {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "restoring"})
+		return
+	}
+	limit := store.DefaultHistoryLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			badRequest(w, fmt.Errorf("limit 必须是整数，得到 %q", raw))
+			return
+		}
+		limit = v
+	}
+	var before *int64
+	if raw := r.URL.Query().Get("before_version"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			badRequest(w, fmt.Errorf("before_version 必须是整数，得到 %q", raw))
+			return
+		}
+		before = &v
+	}
+
+	records, err := s.store.ListHistory(r.Context(), r.PathValue("ns"), r.PathValue("data_id"), limit, before)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+		return
+	}
+	out := make([]map[string]any, 0, len(records))
+	for _, rec := range records {
+		tags := rec.Tags
+		if tags == nil {
+			tags = map[string]string{}
+		}
+		out = append(out, map[string]any{
+			"version":    rec.Version,
+			"op":         rec.Op,
+			"data_type":  rec.DataType,
+			"content":    rec.Content,
+			"tags":       tags,
+			"actor":      rec.Actor,
+			"created_at": rec.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleGet 读当前条目（本机 PG，允许陈旧；DESIGN §5.1）。

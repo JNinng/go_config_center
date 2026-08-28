@@ -29,6 +29,10 @@ func pub(ns, dataID, content string, expected *int64) raftlog.PublishData {
 	}
 }
 
+func del(ns, dataID string, expected *int64) raftlog.DeleteData {
+	return raftlog.DeleteData{Namespace: ns, DataId: dataID, ExpectedVersion: expected}
+}
+
 func TestApplyPublishFirstVersionIsOne(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
@@ -206,6 +210,158 @@ func TestGetEntryMissingReturnsNil(t *testing.T) {
 	}
 	if entry != nil {
 		t.Fatalf("entry = %+v, want nil", entry)
+	}
+}
+
+// 删除写 Tombstone（ADR-0010）：biz_configs 行消失，History 追加 op=delete、
+// content 为 NULL 的记录，版本号照常消耗，meta 同事务推进。
+func TestApplyDeleteWritesTombstone(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusOK || res.Version != 2 {
+		t.Fatalf("result = %+v, want ok v2", res)
+	}
+	if entry, _ := st.GetEntry(ctx, t.Name(), "a"); entry != nil {
+		t.Fatalf("删除后 GetEntry = %+v, want nil", entry)
+	}
+	var op string
+	var content, dataType *string
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT op, content, data_type FROM biz_config_history
+		 WHERE namespace=$1 AND data_id='a' AND version=2`, t.Name()).
+		Scan(&op, &content, &dataType); err != nil {
+		t.Fatal(err)
+	}
+	if op != "delete" || content != nil || dataType != nil {
+		t.Fatalf("Tombstone = (op=%s, content=%v, data_type=%v), want (delete, NULL, NULL)", op, content, dataType)
+	}
+	if idx, _, _ := st.LoadMeta(ctx); idx != 2 {
+		t.Fatalf("meta index = %d, want 2", idx)
+	}
+}
+
+// 条目不存在或已删除 → not_found（无物可删），但日志已提交，进度照常推进。
+func TestApplyDeleteMissingReturnsNotFound(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+
+	res, err := st.ApplyDelete(ctx, del(t.Name(), "ghost", nil), 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusNotFound {
+		t.Fatalf("result = %+v, want not_found", res)
+	}
+	if idx, _, _ := st.LoadMeta(ctx); idx != 1 {
+		t.Fatalf("meta index = %d, want 1（无效删除也消耗进度）", idx)
+	}
+}
+
+// Delete 的 CAS（DESIGN §4.1）：expected=0 与删除互斥恒冲突；N 不符冲突且不写 Tombstone。
+func TestApplyDeleteCASMismatch(t *testing.T) {
+	st, dsn := mustOpen(t)
+	ctx := context.Background()
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	zero := int64(0)
+	res, err := st.ApplyDelete(ctx, del(t.Name(), "a", &zero), 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusVersionConflict || res.CurrentVersion != 1 {
+		t.Fatalf("expected=0 删除存活条目: %+v, want conflict current=1", res)
+	}
+
+	wrong := int64(99)
+	res, err = st.ApplyDelete(ctx, del(t.Name(), "a", &wrong), 3, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusVersionConflict || res.CurrentVersion != 1 {
+		t.Fatalf("expected=99: %+v, want conflict current=1", res)
+	}
+
+	if n := testutil.QueryInt(t, dsn,
+		"SELECT count(*) FROM biz_config_history WHERE namespace=$1", t.Name()); n != 1 {
+		t.Fatalf("history 行数 = %d, want 1（冲突不追加 Tombstone）", n)
+	}
+	if idx, _, _ := st.LoadMeta(ctx); idx != 3 {
+		t.Fatalf("meta index = %d, want 3", idx)
+	}
+}
+
+// 删除后重建延续同一版本序列（DESIGN §3.1）：墓碑占用的版本号不回收。
+func TestRepublishAfterDeleteContinuesVersion(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 2, 1); res.Status != raftlog.StatusOK {
+		t.Fatalf("delete: %+v", res)
+	}
+	res, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "reborn", nil), 3, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusOK || res.Version != 3 || !res.Created {
+		t.Fatalf("删除后重建 = %+v, want ok v3 created", res)
+	}
+}
+
+// ListHistory 倒序分页（DESIGN §5.1）：含 Tombstone，支持 limit / before_version。
+func TestListHistory(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+	withTags := pub(t.Name(), "a", "v1", nil)
+	withTags.Tags = map[string]string{"team": "core"}
+	if _, err := st.ApplyPublish(ctx, withTags, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 3, 1); res.Status != raftlog.StatusOK {
+		t.Fatalf("delete: %+v", res)
+	}
+
+	records, err := st.ListHistory(ctx, t.Name(), "a", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 || records[0].Version != 3 || records[2].Version != 1 {
+		t.Fatalf("records = %+v, want 倒序 [3 2 1]", records)
+	}
+	if records[0].Op != "delete" || records[0].Content != nil || records[0].DataType != nil {
+		t.Fatalf("墓碑记录 = %+v, want op=delete content NULL", records[0])
+	}
+	if records[2].Op != "publish" || records[2].Content == nil || records[2].Tags["team"] != "core" {
+		t.Fatalf("publish 记录 = %+v, want 含 content 与 tags", records[2])
+	}
+
+	if records, _ = st.ListHistory(ctx, t.Name(), "a", 2, nil); len(records) != 2 ||
+		records[0].Version != 3 || records[1].Version != 2 {
+		t.Fatalf("limit=2 = %+v, want [3 2]", records)
+	}
+	two := int64(2)
+	if records, _ = st.ListHistory(ctx, t.Name(), "a", 50, &two); len(records) != 1 || records[0].Version != 1 {
+		t.Fatalf("before_version=2 = %+v, want [1]", records)
+	}
+	if records, _ = st.ListHistory(ctx, t.Name(), "a", MaxHistoryLimit+10, nil); len(records) != 3 {
+		t.Fatalf("超上限 limit 收敛后 = %d 条, want 3", len(records))
+	}
+	if records, _ = st.ListHistory(ctx, t.Name(), "nope", 0, nil); len(records) != 0 {
+		t.Fatalf("不存在的条目 = %d 条, want 0", len(records))
 	}
 }
 

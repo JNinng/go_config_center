@@ -56,17 +56,8 @@ func NewPublish(d PublishData) (Command, error) {
 }
 
 func validatePublish(d PublishData) error {
-	if d.Namespace == "" {
-		return errors.New("namespace 不能为空")
-	}
-	if len(d.Namespace) > MaxNamespaceLen {
-		return fmt.Errorf("namespace 长度超过 %d", MaxNamespaceLen)
-	}
-	if d.DataId == "" {
-		return errors.New("data_id 不能为空")
-	}
-	if len(d.DataId) > MaxDataIdLen {
-		return fmt.Errorf("data_id 长度超过 %d", MaxDataIdLen)
+	if err := validateIdentity(d.Namespace, d.DataId); err != nil {
+		return err
 	}
 	switch d.DataType {
 	case "JSON", "YAML", "TEXT":
@@ -92,6 +83,63 @@ func (c Command) Publish() (PublishData, error) {
 		return PublishData{}, err
 	}
 	return d, nil
+}
+
+// DeleteData 是 op=delete 的 data 载荷。ExpectedVersion 为 nil 表示省略（LWW）。
+type DeleteData struct {
+	Namespace       string `json:"namespace"`
+	DataId          string `json:"data_id"`
+	ExpectedVersion *int64 `json:"expected_version,omitempty"`
+	Actor           string `json:"actor,omitempty"`
+}
+
+func NewDelete(d DeleteData) (Command, error) {
+	if err := validateDelete(d); err != nil {
+		return Command{}, err
+	}
+	data, err := json.Marshal(d)
+	if err != nil {
+		return Command{}, err
+	}
+	return Command{V: FormatVersion, Op: OpDelete, Data: data}, nil
+}
+
+func validateDelete(d DeleteData) error {
+	if err := validateIdentity(d.Namespace, d.DataId); err != nil {
+		return err
+	}
+	if d.ExpectedVersion != nil && *d.ExpectedVersion < 0 {
+		return errors.New("expected_version 不能为负")
+	}
+	return nil
+}
+
+// Delete 解码并校验 op=delete 的 data 载荷。
+func (c Command) Delete() (DeleteData, error) {
+	var d DeleteData
+	if err := json.Unmarshal(c.Data, &d); err != nil {
+		return DeleteData{}, fmt.Errorf("解析 delete data: %w", err)
+	}
+	if err := validateDelete(d); err != nil {
+		return DeleteData{}, err
+	}
+	return d, nil
+}
+
+func validateIdentity(namespace, dataId string) error {
+	if namespace == "" {
+		return errors.New("namespace 不能为空")
+	}
+	if len(namespace) > MaxNamespaceLen {
+		return fmt.Errorf("namespace 长度超过 %d", MaxNamespaceLen)
+	}
+	if dataId == "" {
+		return errors.New("data_id 不能为空")
+	}
+	if len(dataId) > MaxDataIdLen {
+		return fmt.Errorf("data_id 长度超过 %d", MaxDataIdLen)
+	}
+	return nil
 }
 
 func Encode(c Command) ([]byte, error) {

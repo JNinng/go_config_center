@@ -45,6 +45,21 @@ func publishLog(t *testing.T, index, term uint64, ns, dataID, content string, ex
 	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
 }
 
+func deleteLog(t *testing.T, index, term uint64, ns, dataID string, expected *int64) *raft.Log {
+	t.Helper()
+	cmd, err := raftlog.NewDelete(raftlog.DeleteData{
+		Namespace: ns, DataId: dataID, ExpectedVersion: expected,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := raftlog.Encode(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
+}
+
 func apply(t *testing.T, f *FSM, l *raft.Log) raftlog.Result {
 	t.Helper()
 	res, ok := f.Apply(l).(raftlog.Result)
@@ -131,6 +146,70 @@ func TestApplyCASConflictResultCarriedBack(t *testing.T) {
 	idx, _, _ := st.LoadMeta(context.Background())
 	if idx != 2 {
 		t.Fatalf("meta index = %d, want 2（冲突日志也消耗进度）", idx)
+	}
+}
+
+// 验收项：Delete 后 GET 404；History 追加 op=delete、content NULL 的 Tombstone 且占用版本号。
+func TestApplyDeleteWritesTombstone(t *testing.T) {
+	f, st, dsn := mustFSM(t)
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+
+	res := apply(t, f, deleteLog(t, 2, 1, t.Name(), "a", nil))
+	if res.Status != raftlog.StatusOK || res.Version != 2 {
+		t.Fatalf("result = %+v, want ok v2", res)
+	}
+	if entry, _ := st.GetEntry(context.Background(), t.Name(), "a"); entry != nil {
+		t.Fatalf("删除后 GetEntry = %+v, want nil（GET 404）", entry)
+	}
+	if n := testutil.QueryInt(t, dsn,
+		`SELECT count(*) FROM biz_config_history
+		 WHERE namespace=$1 AND op='delete' AND content IS NULL AND version=2`, t.Name()); n != 1 {
+		t.Fatalf("Tombstone 行数 = %d, want 1", n)
+	}
+}
+
+// 删除不存在的条目：结果 not_found，但日志已提交，进度照常推进。
+func TestApplyDeleteMissingEntryNotFound(t *testing.T) {
+	f, st, _ := mustFSM(t)
+	res := apply(t, f, deleteLog(t, 1, 1, t.Name(), "ghost", nil))
+	if res.Status != raftlog.StatusNotFound {
+		t.Fatalf("result = %+v, want not_found", res)
+	}
+	idx, _, _ := st.LoadMeta(context.Background())
+	if idx != 1 {
+		t.Fatalf("meta index = %d, want 1（not_found 也消耗进度）", idx)
+	}
+}
+
+// 验收项：Delete 的 CAS 失败发生在 Apply 阶段，经结果表回传且不写 Tombstone。
+func TestApplyDeleteCASConflictCarriedBack(t *testing.T) {
+	f, st, dsn := mustFSM(t)
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+
+	wrong := int64(99)
+	res := apply(t, f, deleteLog(t, 2, 1, t.Name(), "a", &wrong))
+	if res.Status != raftlog.StatusVersionConflict || res.CurrentVersion != 1 {
+		t.Fatalf("result = %+v, want conflict current=1", res)
+	}
+	if n := testutil.QueryInt(t, dsn,
+		"SELECT count(*) FROM biz_config_history WHERE namespace=$1", t.Name()); n != 1 {
+		t.Fatalf("history 行数 = %d, want 1（冲突不追加 Tombstone）", n)
+	}
+	idx, _, _ := st.LoadMeta(context.Background())
+	if idx != 2 {
+		t.Fatalf("meta index = %d, want 2", idx)
+	}
+}
+
+// 删除后重建延续版本序列：墓碑占用的版本号不回收（DESIGN §3.1）。
+func TestApplyDeleteThenRepublishContinuesVersion(t *testing.T) {
+	f, _, _ := mustFSM(t)
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+	apply(t, f, deleteLog(t, 2, 1, t.Name(), "a", nil))
+
+	res := apply(t, f, publishLog(t, 3, 1, t.Name(), "a", "reborn", nil))
+	if res.Status != raftlog.StatusOK || res.Version != 3 || !res.Created {
+		t.Fatalf("result = %+v, want ok v3 created", res)
 	}
 }
 
