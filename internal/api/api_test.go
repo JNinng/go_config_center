@@ -487,3 +487,102 @@ func TestWatchClientDisconnectReleasesHandler(t *testing.T) {
 		t.Fatal("断连后 Server.Close 未及时完成：挂起 handler 悬挂")
 	}
 }
+
+// 验收：无 token / 错 token 的写请求 401，正确 token 通过。
+func TestWriteEndpointsRequireAdminToken(t *testing.T) {
+	st := mustStore(t)
+	ts := httptest.NewServer(New(fakeProposer{res: raftlog.OK(1, true)}, st, watch.NewHub(), "tok", func() bool { return true }, nil).Routes())
+	defer ts.Close()
+
+	cases := []struct {
+		method, path, body string
+	}{
+		{http.MethodPut, "/v1/namespaces/dev/configs/a", `{"content":"x","data_type":"TEXT"}`},
+		{http.MethodDelete, "/v1/namespaces/dev/configs/a", ""},
+		{http.MethodPost, "/v1/namespaces/dev/configs/a/rollback", `{"to_version":1}`},
+		{http.MethodPost, "/v1/cluster/snapshot", ""},
+	}
+	for _, c := range cases {
+		for _, auth := range []string{"", "Bearer wrong"} {
+			req, _ := http.NewRequest(c.method, ts.URL+c.path, strings.NewReader(c.body))
+			if auth != "" {
+				req.Header.Set("Authorization", auth)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("%s %s auth=%q = %d, want 401", c.method, c.path, auth, resp.StatusCode)
+			}
+		}
+	}
+
+	// 正确 token 通过认证进入业务路径（fakeProposer 返回 OK → 200）。
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/namespaces/dev/configs/a", strings.NewReader(`{"content":"x","data_type":"TEXT"}`))
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("正确 token PUT = %d, want 200", resp.StatusCode)
+	}
+}
+
+// 验收：/healthz 在 PG 断连时转为不健康。
+func TestHealthzReflectsPGConnectivity(t *testing.T) {
+	st := mustStore(t)
+	ts := httptest.NewServer(New(nil, st, watch.NewHub(), "tok", func() bool { return true }, nil).Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PG 正常时 healthz = %d, want 200", resp.StatusCode)
+	}
+
+	st.Close() // 模拟 PG 断连（连接池关闭，Ping 失败）
+	resp, err = http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("PG 断连后 healthz = %d, want 503", resp.StatusCode)
+	}
+}
+
+// 验收：/readyz 反映 Serving 门闩（全量恢复期间 not ready，恢复后 ready）。
+func TestReadyzReflectsServingLatch(t *testing.T) {
+	ready := &atomic.Bool{}
+	srv, _, cleanup := mustServer(t, func() bool { return ready.Load() }, nil)
+	defer cleanup()
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	ready.Store(false)
+	resp, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("门闩关闭时 readyz = %d, want 503 + Retry-After", resp.StatusCode)
+	}
+
+	ready.Store(true)
+	resp, err = http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("门闩打开后 readyz = %d, want 200", resp.StatusCode)
+	}
+}

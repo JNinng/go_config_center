@@ -11,6 +11,8 @@ import (
 	"github.com/jninng/go_config_center/internal/store"
 	"github.com/jninng/go_config_center/internal/testutil"
 	"github.com/jninng/go_config_center/internal/watch"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func mustFSM(t *testing.T) (*FSM, *store.Store, string) {
@@ -340,5 +342,51 @@ func TestApplyNotifiesWatchHub(t *testing.T) {
 	case ev := <-events:
 		t.Fatalf("冲突不应唤醒: %+v", ev)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// 验收：/metrics 最低集合中 fsm_apply_results_total 按 result 标签区分四类结果（DESIGN §7）。
+func TestApplyResultsMetricsLabels(t *testing.T) {
+	f, _, _ := mustFSM(t)
+	// 覆盖 ok / version_conflict / not_found / invalid_rollback 四类 Apply 结果。
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+	wrong := int64(99)
+	apply(t, f, publishLog(t, 2, 1, t.Name(), "a", "v2", &wrong))
+	apply(t, f, deleteLog(t, 3, 1, t.Name(), "ghost", nil))
+	apply(t, f, rollbackLog(t, 4, 1, t.Name(), "a", 99))
+
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	type seriesKey struct{ name, result string }
+	seen := map[seriesKey]bool{}
+	names := map[string]bool{}
+	for _, mf := range mfs {
+		names[mf.GetName()] = true
+		if mf.GetType() != dto.MetricType_COUNTER || mf.GetName() != "fsm_apply_results_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "result" {
+					seen[seriesKey{mf.GetName(), l.GetValue()}] = true
+				}
+			}
+		}
+	}
+	for _, result := range []string{"ok", "version_conflict", "not_found", "invalid_rollback"} {
+		if !seen[seriesKey{"fsm_apply_results_total", result}] {
+			t.Fatalf("fsm_apply_results_total 缺少 result=%q 序列（现有 %v）", result, seen)
+		}
+	}
+	for _, name := range []string{
+		"fsm_last_applied_index", "fsm_apply_duration_seconds",
+		"watch_waiters", "watch_notifications_total",
+		"snapshot_duration_seconds", "snapshot_size_bytes", "restore_skipped_total",
+	} {
+		if !names[name] {
+			t.Fatalf("指标缺失: %s", name)
+		}
 	}
 }

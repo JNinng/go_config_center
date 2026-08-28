@@ -300,10 +300,10 @@ config-center --config config.yaml
 ### Phase 1 — 单节点 MVP
 - [x] PG 三表 schema 与启动迁移
 - [x] Raft 集成：boltdb LogStore + FileSnapshotStore + 单节点 Bootstrap
-- [ ] PostgresFSM：Apply（三操作 + 幂等跳过 + 结果表）、快照导出、跳过式 Restore、Serving 门闩
-- [ ] 配置 API：PUT/GET/DELETE + CAS；History/Rollback API；Watch 长轮询
-- [ ] Admin Token 认证、/healthz、/readyz、/metrics
-- **DoD**：幂等性属性测试通过；空库启动 ≤3s 断言；单节点全 API 集成测试
+- [x] PostgresFSM：Apply（三操作 + 幂等跳过 + 结果表）、快照导出、跳过式 Restore、Serving 门闩
+- [x] 配置 API：PUT/GET/DELETE + CAS；History/Rollback API；Watch 长轮询
+- [x] Admin Token 认证、/healthz、/readyz、/metrics
+- **DoD**：幂等性属性测试通过；空库启动 ≤3s 断言；单节点全 API 集成测试（已完成，见 .scratch/config-center-mvp/issues/01~07 验收记录）
 
 ### Phase 2 — 集群
 - [ ] 发现代理（Seed 扫描 + 退避重试）与 Join API

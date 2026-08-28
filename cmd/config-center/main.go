@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,6 +27,8 @@ import (
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
 	"github.com/jninng/go_config_center/internal/watch"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 func main() {
@@ -138,6 +142,44 @@ func main() {
 			} else {
 				logger.Info("失去或尚未获得 Leader 身份", "node_id", nodeID)
 			}
+		}
+	}()
+
+	// 共识状态指标（DESIGN §7）：周期采集 Raft 角色与进度。
+	raftRole := promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "raft_role",
+		Help: "当前 Raft 角色（命中角色为 1，其余为 0）",
+	}, []string{"role"})
+	raftTerm := promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "raft_term",
+		Help: "当前 Raft term",
+	})
+	raftCommitIndex := promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "raft_commit_index",
+		Help: "已提交日志 index",
+	})
+	go func() {
+		update := func() {
+			state := r.State().String()
+			for _, role := range []string{"Leader", "Candidate", "Follower", "Shutdown"} {
+				val := 0.0
+				if strings.EqualFold(state, role) {
+					val = 1
+				}
+				raftRole.WithLabelValues(strings.ToLower(role)).Set(val)
+			}
+			if term, err := strconv.ParseUint(r.Stats()["term"], 10, 64); err == nil {
+				raftTerm.Set(float64(term))
+			}
+			if commit, err := strconv.ParseUint(r.Stats()["commit_index"], 10, 64); err == nil {
+				raftCommitIndex.Set(float64(commit))
+			}
+		}
+		update()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			update()
 		}
 	}()
 

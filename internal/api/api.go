@@ -15,6 +15,8 @@ import (
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
 	"github.com/jninng/go_config_center/internal/watch"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -53,7 +55,27 @@ func New(p Proposer, st *store.Store, hub *watch.Hub, adminToken string, ready f
 	return &Server{proposer: p, store: st, hub: hub, adminToken: adminToken, ready: ready, snapshot: snapshot}
 }
 
-func (s *Server) Routes() *http.ServeMux {
+// httpRequestDuration 按 ServeMux 路由模式记录 API 延迟（DESIGN §7）。
+var httpRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "http_request_duration_seconds",
+	Help:    "API 请求延迟",
+	Buckets: prometheus.DefBuckets,
+}, []string{"route"})
+
+// withMetrics 记录每路由请求延迟；route 为匹配到的路由模式（含 {} 占位符）。
+func withMetrics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		route := r.Pattern
+		if route == "" {
+			route = "unmatched"
+		}
+		httpRequestDuration.WithLabelValues(route).Observe(time.Since(start).Seconds())
+	})
+}
+
+func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/namespaces/{ns}/configs/{data_id}", s.handlePublish)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}", s.handleGet)
@@ -65,7 +87,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.Handler())
-	return mux
+	return withMetrics(mux)
 }
 
 type publishBody struct {
