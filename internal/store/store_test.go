@@ -33,6 +33,10 @@ func del(ns, dataID string, expected *int64) raftlog.DeleteData {
 	return raftlog.DeleteData{Namespace: ns, DataId: dataID, ExpectedVersion: expected}
 }
 
+func rb(ns, dataID string, toVersion int64) raftlog.RollbackData {
+	return raftlog.RollbackData{Namespace: ns, DataId: dataID, ToVersion: toVersion}
+}
+
 func TestApplyPublishFirstVersionIsOne(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
@@ -362,6 +366,139 @@ func TestListHistory(t *testing.T) {
 	}
 	if records, _ = st.ListHistory(ctx, t.Name(), "nope", 0, nil); len(records) != 0 {
 		t.Fatalf("不存在的条目 = %d 条, want 0", len(records))
+	}
+}
+
+// Rollback 以旧内容发布新版本（ADR-0006）：内容恢复、History 追加 publish 记录、版本延续。
+func TestApplyRollbackPublishesOldContentAsNewVersion(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+	v1 := pub(t.Name(), "a", "v1-content", nil)
+	v1.Tags = map[string]string{"team": "core"}
+	if _, err := st.ApplyPublish(ctx, v1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2-content", nil), 2, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), 3, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusOK || res.Version != 3 || res.Created {
+		t.Fatalf("result = %+v, want ok v3", res)
+	}
+	entry, _ := st.GetEntry(ctx, t.Name(), "a")
+	if entry == nil || entry.Version != 3 || entry.Content != "v1-content" || entry.Tags["team"] != "core" {
+		t.Fatalf("entry = %+v, want v3 内容与 tags 均为 v1 版", entry)
+	}
+	var op string
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT op FROM biz_config_history WHERE namespace=$1 AND data_id='a' AND version=3`,
+		t.Name()).Scan(&op); err != nil {
+		t.Fatal(err)
+	}
+	if op != "publish" {
+		t.Fatalf("History 记录 op = %s, want publish", op)
+	}
+}
+
+// 无效目标：History 中不存在 → not_found；指向墓碑或 ≥ 当前版本 → invalid_rollback；
+// 二者都不追加 History，进度照常推进。
+func TestApplyRollbackInvalidTargets(t *testing.T) {
+	st, dsn := mustOpen(t)
+	ctx := context.Background()
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 3, 1); res.Status != raftlog.StatusOK {
+		t.Fatalf("delete: %+v", res)
+	}
+
+	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 99), 4, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusNotFound {
+		t.Fatalf("to_version=99 = %+v, want not_found", res)
+	}
+	res, err = st.ApplyRollback(ctx, rb(t.Name(), "a", 3), 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusInvalidRollback || res.CurrentVersion != 3 {
+		t.Fatalf("to_version=3（墓碑）= %+v, want invalid_rollback current=3", res)
+	}
+	res, err = st.ApplyRollback(ctx, rb(t.Name(), "ghost", 1), 6, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusNotFound {
+		t.Fatalf("条目从未存在 = %+v, want not_found", res)
+	}
+	if n := testutil.QueryInt(t, dsn,
+		"SELECT count(*) FROM biz_config_history WHERE namespace=$1", t.Name()); n != 3 {
+		t.Fatalf("history 行数 = %d, want 3（无效回滚不追加记录）", n)
+	}
+	if idx, _, _ := st.LoadMeta(ctx); idx != 6 {
+		t.Fatalf("meta index = %d, want 6（无效回滚也消耗进度）", idx)
+	}
+}
+
+// 链式回滚：回滚后仍可回滚到任何既存版本；删除后回滚可重建条目（Tombstone 语义）。
+func TestApplyRollbackChainAndRebuild(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), 3, 1); res.Version != 3 {
+		t.Fatalf("rollback to 1: %+v", res)
+	}
+	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 2), 4, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusOK || res.Version != 4 {
+		t.Fatalf("链式回滚 to 2 = %+v, want ok v4", res)
+	}
+	if entry, _ := st.GetEntry(ctx, t.Name(), "a"); entry == nil || entry.Content != "v2" {
+		t.Fatalf("entry = %+v, want 内容 v2", entry)
+	}
+
+	// 删除后回滚：current 为墓碑版本 5，回滚到 v4 重建为 v6。
+	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 5, 1); res.Status != raftlog.StatusOK {
+		t.Fatalf("delete: %+v", res)
+	}
+	res, err = st.ApplyRollback(ctx, rb(t.Name(), "a", 4), 6, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusOK || res.Version != 6 || !res.Created {
+		t.Fatalf("墓碑后回滚 = %+v, want ok v6 created", res)
+	}
+}
+
+// 回滚目标解析在 Apply 事务内：同一事务读到的 current 决定有效性判定。
+func TestApplyRollbackToCurrentVersionRejected(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusInvalidRollback {
+		t.Fatalf("回滚到当前版本 = %+v, want invalid_rollback", res)
 	}
 }
 

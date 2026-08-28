@@ -51,6 +51,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}", s.handleGet)
 	mux.HandleFunc("DELETE /v1/namespaces/{ns}/configs/{data_id}", s.handleDelete)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/versions", s.handleVersions)
+	mux.HandleFunc("POST /v1/namespaces/{ns}/configs/{data_id}/rollback", s.handleRollback)
 	mux.HandleFunc("POST /v1/cluster/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
@@ -180,6 +181,59 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "version_conflict", "current_version": res.CurrentVersion})
 	case raftlog.StatusNotFound:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
+	}
+}
+
+// handleRollback 处理回滚（DESIGN §4.2/§5.1）：以 to_version 从 History 取内容发布为新版本。
+// to_version 的解析在 FSM Apply 阶段（本端点不预取，无 TOCTOU）。
+// 404 = 条目从未存在或目标不在 History；409 = 目标指向 Tombstone 或 ≥ 当前版本。
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	var body struct {
+		ToVersion *int64 `json:"to_version"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4*1024)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		badRequest(w, fmt.Errorf("body 须为 {\"to_version\":N}: %w", err))
+		return
+	}
+	if body.ToVersion == nil || *body.ToVersion <= 0 {
+		badRequest(w, fmt.Errorf("to_version 必须为正整数"))
+		return
+	}
+
+	cmd, err := raftlog.NewRollback(raftlog.RollbackData{
+		Namespace: r.PathValue("ns"),
+		DataId:    r.PathValue("data_id"),
+		ToVersion: *body.ToVersion,
+		Actor:     "admin",
+	})
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+	b, err := raftlog.Encode(cmd)
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+
+	res, ok := s.propose(w, r, b)
+	if !ok {
+		return
+	}
+	switch res.Status {
+	case raftlog.StatusOK:
+		writeJSON(w, http.StatusOK, map[string]any{"version": res.Version})
+	case raftlog.StatusNotFound:
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+	case raftlog.StatusInvalidRollback:
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "invalid_rollback", "current_version": res.CurrentVersion})
 	default:
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
 	}

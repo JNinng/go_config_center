@@ -60,6 +60,21 @@ func deleteLog(t *testing.T, index, term uint64, ns, dataID string, expected *in
 	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
 }
 
+func rollbackLog(t *testing.T, index, term uint64, ns, dataID string, toVersion int64) *raft.Log {
+	t.Helper()
+	cmd, err := raftlog.NewRollback(raftlog.RollbackData{
+		Namespace: ns, DataId: dataID, ToVersion: toVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := raftlog.Encode(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
+}
+
 func apply(t *testing.T, f *FSM, l *raft.Log) raftlog.Result {
 	t.Helper()
 	res, ok := f.Apply(l).(raftlog.Result)
@@ -210,6 +225,42 @@ func TestApplyDeleteThenRepublishContinuesVersion(t *testing.T) {
 	res := apply(t, f, publishLog(t, 3, 1, t.Name(), "a", "reborn", nil))
 	if res.Status != raftlog.StatusOK || res.Version != 3 || !res.Created {
 		t.Fatalf("result = %+v, want ok v3 created", res)
+	}
+}
+
+// 验收项：Rollback 以旧内容发布新版本，结果经 Apply 回传。
+func TestApplyRollbackRestoresOldContent(t *testing.T) {
+	f, st, _ := mustFSM(t)
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+	apply(t, f, publishLog(t, 2, 1, t.Name(), "a", "v2", nil))
+
+	res := apply(t, f, rollbackLog(t, 3, 1, t.Name(), "a", 1))
+	if res.Status != raftlog.StatusOK || res.Version != 3 {
+		t.Fatalf("result = %+v, want ok v3", res)
+	}
+	entry, _ := st.GetEntry(context.Background(), t.Name(), "a")
+	if entry == nil || entry.Content != "v1" || entry.Version != 3 {
+		t.Fatalf("entry = %+v, want v3 内容 v1", entry)
+	}
+}
+
+// 验收项：无效回滚目标在 Apply 阶段判定（404/409），进度照常推进。
+func TestApplyRollbackInvalidTargets(t *testing.T) {
+	f, st, _ := mustFSM(t)
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+	apply(t, f, deleteLog(t, 2, 1, t.Name(), "a", nil))
+
+	res := apply(t, f, rollbackLog(t, 3, 1, t.Name(), "a", 99))
+	if res.Status != raftlog.StatusNotFound {
+		t.Fatalf("to_version=99 = %+v, want not_found", res)
+	}
+	res = apply(t, f, rollbackLog(t, 4, 1, t.Name(), "a", 2))
+	if res.Status != raftlog.StatusInvalidRollback || res.CurrentVersion != 2 {
+		t.Fatalf("to_version=2（墓碑）= %+v, want invalid_rollback current=2", res)
+	}
+	idx, _, _ := st.LoadMeta(context.Background())
+	if idx != 4 {
+		t.Fatalf("meta index = %d, want 4", idx)
 	}
 }
 

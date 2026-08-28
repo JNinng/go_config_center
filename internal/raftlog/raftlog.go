@@ -126,6 +126,48 @@ func (c Command) Delete() (DeleteData, error) {
 	return d, nil
 }
 
+// RollbackData 是 op=rollback 的 data 载荷（DESIGN §3.2）。
+// to_version 的解析在 FSM Apply 阶段进行，API 层不预取，消除与并发写的竞态。
+type RollbackData struct {
+	Namespace string `json:"namespace"`
+	DataId    string `json:"data_id"`
+	ToVersion int64  `json:"to_version"`
+	Actor     string `json:"actor,omitempty"`
+}
+
+func NewRollback(d RollbackData) (Command, error) {
+	if err := validateRollback(d); err != nil {
+		return Command{}, err
+	}
+	data, err := json.Marshal(d)
+	if err != nil {
+		return Command{}, err
+	}
+	return Command{V: FormatVersion, Op: OpRollback, Data: data}, nil
+}
+
+func validateRollback(d RollbackData) error {
+	if err := validateIdentity(d.Namespace, d.DataId); err != nil {
+		return err
+	}
+	if d.ToVersion <= 0 {
+		return fmt.Errorf("to_version 必须为正整数，得到 %d", d.ToVersion)
+	}
+	return nil
+}
+
+// Rollback 解码并校验 op=rollback 的 data 载荷。
+func (c Command) Rollback() (RollbackData, error) {
+	var d RollbackData
+	if err := json.Unmarshal(c.Data, &d); err != nil {
+		return RollbackData{}, fmt.Errorf("解析 rollback data: %w", err)
+	}
+	if err := validateRollback(d); err != nil {
+		return RollbackData{}, err
+	}
+	return d, nil
+}
+
 func validateIdentity(namespace, dataId string) error {
 	if namespace == "" {
 		return errors.New("namespace 不能为空")

@@ -146,8 +146,20 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		metrics.applyResults.WithLabelValues(string(res.Status)).Inc()
 		return res, raftlog.OpDelete
 
+	case raftlog.OpRollback:
+		data, err := cmd.Rollback()
+		if err != nil {
+			return f.advanceOnly(l, err, "rollback 载荷非法，仅推进进度"), raftlog.OpRollback
+		}
+		res, err := f.store.ApplyRollback(context.Background(), data, l.Index, l.Term)
+		if err != nil {
+			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
+		}
+		metrics.applyResults.WithLabelValues(string(res.Status)).Inc()
+		return res, raftlog.OpRollback
+
 	default:
-		// rollback 在票 04 实现；出现即推进进度，避免毒日志卡死重放。
+		// 未知 op：推进进度，避免毒日志卡死重放。
 		return f.advanceOnly(l, fmt.Errorf("op %q 尚未实现", cmd.Op), "op 尚未实现，仅推进进度"), cmd.Op
 	}
 }

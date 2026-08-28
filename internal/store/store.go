@@ -185,14 +185,7 @@ func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, index, 
 			mismatch = current != *d.ExpectedVersion
 		}
 		if mismatch {
-			if err := advanceMeta(tctx, tx, index, term); err != nil {
-				return raftlog.Result{}, err
-			}
-			if err := tx.Commit(tctx); err != nil {
-				return raftlog.Result{}, fmt.Errorf("提交（冲突路径）: %w", err)
-			}
-			committed = true
-			return raftlog.Conflict(current), nil
+			return finishRejected(tctx, tx, &committed, index, term, raftlog.Conflict(current))
 		}
 	}
 
@@ -253,14 +246,8 @@ func (s *Store) ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, te
 		d.Namespace, d.DataId).Scan(&current)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		if err := advanceMeta(tctx, tx, index, term); err != nil {
-			return raftlog.Result{}, err
-		}
-		if err := tx.Commit(tctx); err != nil {
-			return raftlog.Result{}, fmt.Errorf("提交（无条目路径）: %w", err)
-		}
-		committed = true
-		return raftlog.Result{Status: raftlog.StatusNotFound}, nil
+		return finishRejected(tctx, tx, &committed, index, term,
+			raftlog.Result{Status: raftlog.StatusNotFound})
 	case err != nil:
 		return raftlog.Result{}, fmt.Errorf("读取当前版本: %w", err)
 	}
@@ -268,14 +255,7 @@ func (s *Store) ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, te
 	// CAS（DESIGN §4.1）：省略恒通过；0 = create-if-absent，与删除互斥——
 	// 走到这里条目必然存活，恒冲突；N>0 = 当前版本恰为 N。
 	if d.ExpectedVersion != nil && (*d.ExpectedVersion == 0 || current != *d.ExpectedVersion) {
-		if err := advanceMeta(tctx, tx, index, term); err != nil {
-			return raftlog.Result{}, err
-		}
-		if err := tx.Commit(tctx); err != nil {
-			return raftlog.Result{}, fmt.Errorf("提交（冲突路径）: %w", err)
-		}
-		committed = true
-		return raftlog.Conflict(current), nil
+		return finishRejected(tctx, tx, &committed, index, term, raftlog.Conflict(current))
 	}
 
 	if _, err = tx.Exec(tctx,
@@ -298,6 +278,113 @@ func (s *Store) ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, te
 	}
 	committed = true
 	return raftlog.OK(current+1, false), nil
+}
+
+// ApplyRollback 在单个 PG 事务内完成 op=rollback（DESIGN §4.2）：从 History 解析
+// to_version 的内容，作为一次 Publish 发布为新版本——从不物理撤销，版本序列延续。
+// 目标解析与发布同事务，消除与并发写的竞态（无 TOCTOU）。
+// 无效目标：History 中不存在 → not_found；指向 Tombstone 或 ≥ 当前版本 → invalid_rollback。
+// 二者都是已提交日志：不追加 History，进度同事务推进。
+func (s *Store) ApplyRollback(ctx context.Context, d raftlog.RollbackData, index, term uint64) (raftlog.Result, error) {
+	tctx, cancel := context.WithTimeout(ctx, applyTimeout)
+	defer cancel()
+
+	tx, err := s.pool.Begin(tctx)
+	if err != nil {
+		return raftlog.Result{}, fmt.Errorf("开启事务: %w", err)
+	}
+	committed := false
+	defer RollbackUnlessCommitted(tctx, tx, &committed)()
+
+	// 当前版本：存活条目优先；已删除时为墓碑版本——回滚到墓碑之前的任意版本可重建条目。
+	var current int64
+	var live bool
+	err = tx.QueryRow(tctx,
+		`SELECT version FROM biz_configs WHERE namespace = $1 AND data_id = $2`,
+		d.Namespace, d.DataId).Scan(&current)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		live = false
+		err = tx.QueryRow(tctx,
+			`SELECT COALESCE(MAX(version), 0) FROM biz_config_history
+			 WHERE namespace = $1 AND data_id = $2`,
+			d.Namespace, d.DataId).Scan(&current)
+		if err != nil {
+			return raftlog.Result{}, fmt.Errorf("读取 History 版本: %w", err)
+		}
+	case err != nil:
+		return raftlog.Result{}, fmt.Errorf("读取当前版本: %w", err)
+	default:
+		live = true
+	}
+
+	// 目标校验发生在 Apply 阶段（DESIGN §4.2）：不存在 → 404；墓碑或 ≥ 当前版本 → 409。
+	var op string
+	var dataType, content *string
+	var tags []byte
+	err = tx.QueryRow(tctx, `
+		SELECT op, data_type, content, tags FROM biz_config_history
+		WHERE namespace = $1 AND data_id = $2 AND version = $3`,
+		d.Namespace, d.DataId, d.ToVersion).Scan(&op, &dataType, &content, &tags)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return finishRejected(tctx, tx, &committed, index, term,
+			raftlog.Result{Status: raftlog.StatusNotFound, Err: "to_version 在 History 中不存在"})
+	case err != nil:
+		return raftlog.Result{}, fmt.Errorf("读取回滚目标: %w", err)
+	}
+	if op == "delete" || d.ToVersion >= current {
+		return finishRejected(tctx, tx, &committed, index, term,
+			raftlog.Result{Status: raftlog.StatusInvalidRollback,
+				Err:            "to_version 指向 Tombstone 或不小于当前版本",
+				CurrentVersion: current})
+	}
+
+	version := current + 1
+	var tagsPtr *string
+	if tags != nil {
+		s := string(tags)
+		tagsPtr = &s
+	}
+	if _, err = tx.Exec(tctx, `
+		INSERT INTO biz_configs (namespace, data_id, data_type, content, version, tags)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+		ON CONFLICT (namespace, data_id) DO UPDATE SET
+			data_type  = EXCLUDED.data_type,
+			content    = EXCLUDED.content,
+			version    = EXCLUDED.version,
+			tags       = EXCLUDED.tags,
+			updated_at = now()`,
+		d.Namespace, d.DataId, *dataType, *content, version, tagsPtr); err != nil {
+		return raftlog.Result{}, fmt.Errorf("upsert biz_configs: %w", err)
+	}
+	if _, err = tx.Exec(tctx, `
+		INSERT INTO biz_config_history (namespace, data_id, version, op, data_type, content, tags, actor)
+		VALUES ($1, $2, $3, 'publish', $4, $5, $6::jsonb, $7)`,
+		d.Namespace, d.DataId, version, *dataType, *content, tagsPtr, d.Actor); err != nil {
+		return raftlog.Result{}, fmt.Errorf("追加 History: %w", err)
+	}
+
+	if err := advanceMeta(tctx, tx, index, term); err != nil {
+		return raftlog.Result{}, err
+	}
+	if err := tx.Commit(tctx); err != nil {
+		return raftlog.Result{}, fmt.Errorf("提交: %w", err)
+	}
+	committed = true
+	return raftlog.OK(version, !live), nil
+}
+
+// finishRejected 提交一个拒绝性结果的事务：不追加 History，仅推进 raft_fsm_meta。
+func finishRejected(ctx context.Context, tx pgx.Tx, committed *bool, index, term uint64, res raftlog.Result) (raftlog.Result, error) {
+	if err := advanceMeta(ctx, tx, index, term); err != nil {
+		return raftlog.Result{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return raftlog.Result{}, fmt.Errorf("提交（拒绝路径）: %w", err)
+	}
+	*committed = true
+	return res, nil
 }
 
 // DefaultHistoryLimit 与 MaxHistoryLimit 是 History 查询的默认与上限页大小（DESIGN §5.1）。

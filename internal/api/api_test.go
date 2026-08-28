@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -278,5 +279,67 @@ func TestVersionsEndpoint(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("limit=abc = %d, want 400", resp.StatusCode)
+	}
+}
+
+// 回滚端点（DESIGN §5.1）：认证、body 校验、200/404/409 语义映射。
+func TestRollbackEndpoint(t *testing.T) {
+	st := mustStore(t)
+
+	do := func(t *testing.T, p Proposer, auth, body string) *http.Response {
+		t.Helper()
+		ts := httptest.NewServer(New(p, st, "tok", func() bool { return true }, nil).Routes())
+		defer ts.Close()
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/namespaces/dev/configs/a/rollback", strings.NewReader(body))
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	resp := do(t, fakeProposer{}, "", `{"to_version":1}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("无认证回滚 = %d, want 401", resp.StatusCode)
+	}
+
+	resp = do(t, fakeProposer{res: raftlog.OK(4, false)}, "Bearer tok", `{"to_version":1}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("回滚 = %d, want 200", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["version"] != float64(4) {
+		t.Fatalf("body = %v, want version=4", body)
+	}
+
+	resp = do(t, fakeProposer{res: raftlog.Result{Status: raftlog.StatusInvalidRollback, CurrentVersion: 3}}, "Bearer tok", `{"to_version":3}`)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("无效目标 = %d, want 409", resp.StatusCode)
+	}
+	body = nil
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error"] != "invalid_rollback" || body["current_version"] != float64(3) {
+		t.Fatalf("body = %v, want invalid_rollback + current_version=3", body)
+	}
+
+	resp = do(t, fakeProposer{res: raftlog.Result{Status: raftlog.StatusNotFound}}, "Bearer tok", `{"to_version":99}`)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("目标不存在 = %d, want 404", resp.StatusCode)
+	}
+
+	for _, bad := range []string{`{}`, `{"to_version":0}`, `{"to_version":-1}`, `not-json`} {
+		resp = do(t, fakeProposer{}, "Bearer tok", bad)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("body %q = %d, want 400", bad, resp.StatusCode)
+		}
 	}
 }
