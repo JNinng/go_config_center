@@ -8,19 +8,19 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/jninng/go_config_center/internal/raftlog"
-	"github.com/jninng/go_config_center/internal/store"
+	"github.com/jninng/go_config_center/internal/store/pg"
 	"github.com/jninng/go_config_center/internal/testutil"
 	"github.com/jninng/go_config_center/internal/watch"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
 
-func mustFSM(t *testing.T) (*FSM, *store.Store, string) {
+func mustFSM(t *testing.T) (*FSM, *pg.Store, string) {
 	t.Helper()
 	dsn := testutil.NewDB(t, "gcc_fsm_test")
-	st, err := store.Open(context.Background(), dsn)
+	st, err := pg.Open(context.Background(), dsn)
 	if err != nil {
-		t.Fatalf("store.Open: %v", err)
+		t.Fatalf("pg.Open: %v", err)
 	}
 	if err := st.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate: %v", err)
@@ -298,7 +298,7 @@ func TestResultTableKeepsRecentEntries(t *testing.T) {
 // 验收：FSM Apply 到 Publish/Delete 时唤醒本机挂起的 Watch；未变更状态的日志不唤醒。
 func TestApplyNotifiesWatchHub(t *testing.T) {
 	dsn := testutil.NewDB(t, "gcc_fsm_test")
-	st, err := store.Open(context.Background(), dsn)
+	st, err := pg.Open(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}

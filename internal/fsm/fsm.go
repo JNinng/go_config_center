@@ -1,4 +1,5 @@
-// Package fsm 实现 PostgresFSM：将已提交的 Raft 日志事务性写入本机 PG（DESIGN §3.3）。
+// Package fsm 实现 PostgresFSM：将已提交的 Raft 日志事务性写入本机存储（DESIGN §3.3），
+// 经由 store.Store 接口访问存储后端（当前为 PostgreSQL，见 internal/store/pg）。
 package fsm
 
 import (
@@ -59,7 +60,7 @@ var metrics = struct {
 // FSM 是 hashicorp/raft 的 FSM 实现。Apply/Snapshot/Restore 由 Raft 单 goroutine
 // 串行调度，内部不加锁保护 Apply 路径；互斥锁只保护结果表的并发读（Result）。
 type FSM struct {
-	store *store.Store
+	store store.Store
 	hub   *watch.Hub
 	log   *slog.Logger
 
@@ -74,8 +75,8 @@ type FSM struct {
 	resultKeep uint64
 }
 
-// New 构造 FSM 并从 raft_fsm_meta 恢复进度。hub 为本机 Watch 唤醒源（DESIGN §4.3），可为 nil。
-func New(ctx context.Context, st *store.Store, hub *watch.Hub) (*FSM, error) {
+// New 构造 FSM 并从存储后端恢复进度。hub 为本机 Watch 唤醒源（DESIGN §4.3），可为 nil。
+func New(ctx context.Context, st store.Store, hub *watch.Hub) (*FSM, error) {
 	index, term, err := st.LoadMeta(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("恢复 FSM 进度: %w", err)

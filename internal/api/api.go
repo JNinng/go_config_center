@@ -72,7 +72,7 @@ var (
 // Deps 聚合 Server 的外部依赖；可选依赖缺省时按单节点语义兜底。
 type Deps struct {
 	Proposer    Proposer
-	Store       *store.Store
+	Store       store.Store
 	Hub         *watch.Hub
 	AdminToken  string
 	Ready       func() bool
@@ -91,7 +91,7 @@ const (
 
 type Server struct {
 	proposer   Proposer
-	store      *store.Store
+	store      store.Store
 	hub        *watch.Hub
 	adminToken string
 	ready      func() bool
@@ -572,7 +572,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	if err := s.store.Pool().Ping(ctx); err != nil {
+	if err := s.store.Ping(ctx); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unhealthy", "pg": err.Error()})
 		return
 	}

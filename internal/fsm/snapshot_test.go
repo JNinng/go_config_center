@@ -12,12 +12,13 @@ import (
 
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
+	"github.com/jninng/go_config_center/internal/store/pg"
 	"github.com/jninng/go_config_center/internal/testutil"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // seedAndSnapshot 在全新 FSM 上应用 3 条 publish（ns: a×2 版本、b×1 版本）并生成快照字节流。
-func seedAndSnapshot(t *testing.T) (*FSM, *store.Store, []byte) {
+func seedAndSnapshot(t *testing.T) (*FSM, *pg.Store, []byte) {
 	t.Helper()
 	f, st, _ := mustFSM(t)
 	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
@@ -66,7 +67,7 @@ func TestSnapshotProducesValidStream(t *testing.T) {
 
 	body := buf[bodyOff:]
 	var want int64
-	for _, tbl := range snapshotTables {
+	for _, tbl := range store.SnapshotTables {
 		want += hdr.Tables[tbl].Bytes
 	}
 	if int64(len(body)) != want {
@@ -80,7 +81,7 @@ func TestSnapshotProducesValidStream(t *testing.T) {
 
 // 验收项：带数据重启走跳过路径——本机进度已追平时 Restore 跳过导入，数据不变。
 func TestRestoreSkipsWhenMetaCaughtUp(t *testing.T) {
-	f, _, buf := seedAndSnapshot(t)
+	f, st, buf := seedAndSnapshot(t)
 
 	before := ptestutil.ToFloat64(metrics.restoreSkipped)
 	if err := f.Restore(io.NopCloser(bytes.NewReader(buf))); err != nil {
@@ -94,7 +95,7 @@ func TestRestoreSkipsWhenMetaCaughtUp(t *testing.T) {
 	if idx != 3 || term != 1 {
 		t.Fatalf("进度 = (%d,%d), want (3,1)", idx, term)
 	}
-	if n := historyRows(t, f); n != 3 {
+	if n := historyRows(t, st); n != 3 {
 		t.Fatalf("history 行数 = %d, want 3（跳过不得改写数据）", n)
 	}
 }
@@ -104,7 +105,7 @@ func TestRestoreFullImportWhenBehind(t *testing.T) {
 	_, _, buf := seedAndSnapshot(t)
 
 	dsn := testutil.NewDB(t, "gcc_fsm_import")
-	st, err := store.Open(context.Background(), dsn)
+	st, err := pg.Open(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,9 +147,9 @@ func TestRestoreFullImportWhenBehind(t *testing.T) {
 
 // 验收项：checksum 或 magic 不符时 Restore 显式失败，不产生半写状态。
 func TestRestoreRejectsCorruption(t *testing.T) {
-	makeFreshFSM := func(t *testing.T) *FSM {
+	makeFreshFSM := func(t *testing.T) (*FSM, *pg.Store) {
 		dsn := testutil.NewDB(t, "gcc_fsm_corrupt")
-		st, err := store.Open(context.Background(), dsn)
+		st, err := pg.Open(context.Background(), dsn)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -160,13 +161,13 @@ func TestRestoreRejectsCorruption(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return f
+		return f, st
 	}
 
 	_, _, buf := seedAndSnapshot(t)
 
 	t.Run("数据体损坏", func(t *testing.T) {
-		f := makeFreshFSM(t)
+		f, st := makeFreshFSM(t)
 		corrupt := bytes.Clone(buf)
 		_, hdrEnd, err := parseSnapshotHeader(corrupt)
 		if err != nil {
@@ -176,7 +177,7 @@ func TestRestoreRejectsCorruption(t *testing.T) {
 		if err := f.Restore(io.NopCloser(bytes.NewReader(corrupt))); err == nil {
 			t.Fatal("checksum 不符应显式失败")
 		}
-		if n := historyRows(t, f); n != 0 {
+		if n := historyRows(t, st); n != 0 {
 			t.Fatalf("失败后 history 行数 = %d, want 0（事务必须整体回滚）", n)
 		}
 		if !f.Serving() {
@@ -185,7 +186,7 @@ func TestRestoreRejectsCorruption(t *testing.T) {
 	})
 
 	t.Run("magic 损坏", func(t *testing.T) {
-		f := makeFreshFSM(t)
+		f, _ := makeFreshFSM(t)
 		corrupt := bytes.Clone(buf)
 		corrupt[0] = 'X'
 		if err := f.Restore(io.NopCloser(bytes.NewReader(corrupt))); err == nil {
@@ -194,11 +195,11 @@ func TestRestoreRejectsCorruption(t *testing.T) {
 	})
 
 	t.Run("截断的数据体", func(t *testing.T) {
-		f := makeFreshFSM(t)
+		f, st := makeFreshFSM(t)
 		if err := f.Restore(io.NopCloser(bytes.NewReader(buf[:len(buf)-10]))); err == nil {
 			t.Fatal("截断流应显式失败")
 		}
-		if n := historyRows(t, f); n != 0 {
+		if n := historyRows(t, st); n != 0 {
 			t.Fatalf("失败后 history 行数 = %d, want 0", n)
 		}
 	})
@@ -209,7 +210,7 @@ func TestRestoreServingLatchDuringImport(t *testing.T) {
 	_, _, buf := seedAndSnapshot(t)
 
 	dsn := testutil.NewDB(t, "gcc_fsm_latch")
-	st, err := store.Open(context.Background(), dsn)
+	st, err := pg.Open(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +262,7 @@ func TestRestoreServingLatchDuringImport(t *testing.T) {
 	if !f.Serving() {
 		t.Fatal("导入完成后 Serving 应恢复 true")
 	}
-	if n := historyRows(t, f); n != 3 {
+	if n := historyRows(t, st); n != 3 {
 		t.Fatalf("导入后 history = %d, want 3", n)
 	}
 }
@@ -295,12 +296,12 @@ func (b *blockingReader) release() {
 	}
 }
 
-func historyRows(t *testing.T, f *FSM) int64 {
+func historyRows(t *testing.T, st *pg.Store) int64 {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var n int64
-	if err := f.store.Pool().QueryRow(ctx, "SELECT count(*) FROM biz_config_history").Scan(&n); err != nil {
+	if err := st.Pool().QueryRow(ctx, "SELECT count(*) FROM biz_config_history").Scan(&n); err != nil {
 		t.Fatalf("historyRows: %v", err)
 	}
 	return n

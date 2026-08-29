@@ -12,17 +12,17 @@ import (
 	"time"
 
 	"github.com/jninng/go_config_center/internal/raftlog"
-	"github.com/jninng/go_config_center/internal/store"
+	"github.com/jninng/go_config_center/internal/store/pg"
 	"github.com/jninng/go_config_center/internal/testutil"
 	"github.com/jninng/go_config_center/internal/watch"
 )
 
-func mustStore(t *testing.T) *store.Store {
+func mustStore(t *testing.T) *pg.Store {
 	t.Helper()
 	dsn := testutil.NewDB(t, "gcc_api_test")
-	st, err := store.Open(context.Background(), dsn)
+	st, err := pg.Open(context.Background(), dsn)
 	if err != nil {
-		t.Fatalf("store.Open: %v", err)
+		t.Fatalf("pg.Open: %v", err)
 	}
 	if err := st.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate: %v", err)
@@ -31,7 +31,7 @@ func mustStore(t *testing.T) *store.Store {
 	return st
 }
 
-func mustServer(t *testing.T, ready func() bool, snap func() (uint64, error)) (*Server, *store.Store, func()) {
+func mustServer(t *testing.T, ready func() bool, snap func() (uint64, error)) (*Server, *pg.Store, func()) {
 	t.Helper()
 	st := mustStore(t)
 	return New(Deps{Proposer: nil, Store: st, Hub: nil, AdminToken: "tok", Ready: ready, Snapshot: snap}), st, func() {}

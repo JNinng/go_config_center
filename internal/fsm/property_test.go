@@ -16,7 +16,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/jackc/pgx/v5"
 	"github.com/jninng/go_config_center/internal/raftlog"
-	"github.com/jninng/go_config_center/internal/store"
+	"github.com/jninng/go_config_center/internal/store/pg"
 	"github.com/jninng/go_config_center/internal/testutil"
 )
 
@@ -168,12 +168,12 @@ func digestLines(lines []string) string {
 // memSink 复用 snapshot_test.go 中的实现。
 
 // mustNewFSM 在一次性测试库上构造 FSM。
-func mustNewFSM(t *testing.T) (*FSM, *store.Store, string) {
+func mustNewFSM(t *testing.T) (*FSM, *pg.Store, string) {
 	t.Helper()
 	dsn := testutil.NewDB(t, "gcc_prop_test")
-	st, err := store.Open(context.Background(), dsn)
+	st, err := pg.Open(context.Background(), dsn)
 	if err != nil {
-		t.Fatalf("store.Open: %v", err)
+		t.Fatalf("pg.Open: %v", err)
 	}
 	if err := st.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate: %v", err)

@@ -1,10 +1,11 @@
-package store
+package pg
 
 import (
 	"context"
 	"testing"
 
 	"github.com/jninng/go_config_center/internal/raftlog"
+	"github.com/jninng/go_config_center/internal/store"
 	"github.com/jninng/go_config_center/internal/testutil"
 )
 
@@ -361,7 +362,7 @@ func TestListHistory(t *testing.T) {
 	if records, _ = st.ListHistory(ctx, t.Name(), "a", 50, &two); len(records) != 1 || records[0].Version != 1 {
 		t.Fatalf("before_version=2 = %+v, want [1]", records)
 	}
-	if records, _ = st.ListHistory(ctx, t.Name(), "a", MaxHistoryLimit+10, nil); len(records) != 3 {
+	if records, _ = st.ListHistory(ctx, t.Name(), "a", store.MaxHistoryLimit+10, nil); len(records) != 3 {
 		t.Fatalf("超上限 limit 收敛后 = %d 条, want 3", len(records))
 	}
 	if records, _ = st.ListHistory(ctx, t.Name(), "nope", 0, nil); len(records) != 0 {

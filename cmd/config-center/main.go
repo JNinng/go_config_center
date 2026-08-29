@@ -29,7 +29,7 @@ import (
 	"github.com/jninng/go_config_center/internal/fsm"
 	"github.com/jninng/go_config_center/internal/nodeid"
 	"github.com/jninng/go_config_center/internal/raftlog"
-	"github.com/jninng/go_config_center/internal/store"
+	"github.com/jninng/go_config_center/internal/store/pg"
 	"github.com/jninng/go_config_center/internal/watch"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -60,7 +60,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	st, err := store.Open(ctx, cfg.PgDSN)
+	st, err := pg.Open(ctx, cfg.PgDSN)
 	if err != nil {
 		fatal(logger, "连接 PostgreSQL", err)
 	}

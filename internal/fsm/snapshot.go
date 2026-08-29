@@ -1,7 +1,7 @@
 // 快照导出/导入（DESIGN §4.4、ADR-0007）：
-// 单文件自描述流 = [magic 8B "GCCSNP01"][JSON 头一行][三表 COPY 数据体]。
-// Restore 按本机 raft_fsm_meta 进度决定跳过或全量导入；全量导入单事务提交，
-// checksum/行数/截断任一不符即整体回滚，不产生半写状态。
+// 单文件自描述流 = [magic 8B "GCCSNP01"][JSON 头一行][数据体]。
+// 本文件负责格式骨架：magic、JSON 头、checksum 记账、跳过式恢复判定与 Serving 门闩；
+// 数据体的分节编码与导入原子性由存储后端实现（store.Store.ExportTables/ImportTables）。
 package fsm
 
 import (
@@ -27,10 +27,7 @@ const (
 	snapshotTimeout = 120 * time.Second
 )
 
-// snapshotTables 固定数据体中三表的顺序，导出与导入必须一致。
-var snapshotTables = []string{"biz_configs", "biz_config_history", "raft_fsm_meta"}
-
-// tableSection 记录单表分节的行数与字节长度；字节长度让 Restore 无需解析行边界。
+// tableSection 记录快照头中单表分节的行数与字节长度；字节长度让 Restore 无需解析行边界。
 type tableSection struct {
 	Rows  int64 `json:"rows"`
 	Bytes int64 `json:"bytes"`
@@ -44,11 +41,11 @@ type snapshotHeader struct {
 	Checksum      string                  `json:"checksum"` // 数据体 sha256（hex）
 }
 
-// pgSnapshot 实现 raft.FSMSnapshot：Persist 把 spool 好的数据体写入快照存储的 sink。
+// pgSnapshot 实现 raft.FSMSnapshot：Persist 把 spool 好数据体写入快照存储的 sink。
 type pgSnapshot struct {
-	header     snapshotHeader
-	spoolPaths []string
-	startedAt  time.Time
+	header    snapshotHeader
+	spoolPath string
+	startedAt time.Time
 }
 
 func (p *pgSnapshot) Persist(sink raft.SnapshotSink) error {
@@ -62,110 +59,90 @@ func (p *pgSnapshot) Persist(sink raft.SnapshotSink) error {
 	if _, err := sink.Write(append(hdr, '\n')); err != nil {
 		return fmt.Errorf("写入快照头: %w", err)
 	}
-	var total int64
-	for _, path := range p.spoolPaths {
-		f, err := os.Open(path)
-		if err != nil {
-			return fmt.Errorf("打开分节 spool: %w", err)
-		}
-		n, err := io.Copy(sink, f)
-		_ = f.Close()
-		if err != nil {
-			return fmt.Errorf("写入分节: %w", err)
-		}
-		total += n
+	f, err := os.Open(p.spoolPath)
+	if err != nil {
+		return fmt.Errorf("打开数据体 spool: %w", err)
+	}
+	_, err = io.Copy(sink, f)
+	_ = f.Close()
+	if err != nil {
+		return fmt.Errorf("写入数据体: %w", err)
 	}
 	metrics.snapshotDuration.Observe(time.Since(p.startedAt).Seconds())
-	metrics.snapshotSize.Set(float64(total))
+	metrics.snapshotSize.Set(float64(p.header.totalBytes()))
 	return nil
 }
 
 func (p *pgSnapshot) Release() {
-	for _, path := range p.spoolPaths {
-		_ = os.Remove(path)
-	}
+	_ = os.Remove(p.spoolPath)
 }
 
-// Snapshot 在单个 REPEATABLE READ 事务内导出三表（ADR-0007：快照点 = 该事务内
-// 读到的 raft_fsm_meta）。头中的 checksum 覆盖整个数据体，因此先 spool 到临时文件
-// 计算完成后再由 Persist 写出。
+// Snapshot 经由存储后端在单个一致性读事务内导出三表（ADR-0007：快照点 = 该事务内
+// 读到的 raft_fsm_meta）。数据体先 spool 到临时文件并计算 checksum，再由 Persist
+// 按 [magic][JSON 头][数据体] 顺序写出。
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	startedAt := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 	defer cancel()
 
-	tx, err := f.store.Pool().Begin(ctx)
+	spool, err := os.CreateTemp("", "gcc-snapshot-*.tmp")
 	if err != nil {
-		return nil, fmt.Errorf("开启导出事务: %w", err)
+		return nil, fmt.Errorf("创建数据体 spool: %w", err)
 	}
-	committed := false
-	defer store.RollbackUnlessCommitted(ctx, tx, &committed)()
-
-	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-		return nil, fmt.Errorf("设置隔离级别: %w", err)
-	}
-
-	var index, term int64
-	if err := tx.QueryRow(ctx,
-		`SELECT last_applied_index, last_applied_term FROM raft_fsm_meta WHERE id = 1`).
-		Scan(&index, &term); err != nil {
-		return nil, fmt.Errorf("读取快照点: %w", err)
-	}
-
 	hasher := sha256.New()
+	point, sections, err := f.store.ExportTables(ctx, io.MultiWriter(spool, hasher))
+	if err != nil {
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+		return nil, err
+	}
+	size, seekErr := spool.Seek(0, io.SeekCurrent)
+	if closeErr := spool.Close(); seekErr == nil {
+		seekErr = closeErr
+	}
+	if seekErr != nil {
+		_ = os.Remove(spool.Name())
+		return nil, fmt.Errorf("统计数据体长度: %w", seekErr)
+	}
+	if len(sections) != len(store.SnapshotTables) {
+		_ = os.Remove(spool.Name())
+		return nil, fmt.Errorf("后端返回分节数 %d 与快照格式不符（期望 %d）",
+			len(sections), len(store.SnapshotTables))
+	}
+
 	header := snapshotHeader{
 		FormatVersion: snapshotFormatVersion,
-		RaftIndex:     uint64(index),
-		RaftTerm:      uint64(term),
-		Tables:        make(map[string]tableSection, len(snapshotTables)),
+		RaftIndex:     point.Index,
+		RaftTerm:      point.Term,
+		Checksum:      hex.EncodeToString(hasher.Sum(nil)),
+		Tables:        make(map[string]tableSection, len(store.SnapshotTables)),
 	}
-	var spools []string
-	for _, table := range snapshotTables {
-		spool, err := os.CreateTemp("", "gcc-snapshot-*.tmp")
-		if err != nil {
-			releaseSpools(spools)
-			return nil, fmt.Errorf("创建分节 spool: %w", err)
-		}
-		tag, copyErr := tx.Conn().PgConn().CopyTo(ctx,
-			io.MultiWriter(spool, hasher), "COPY "+table+" TO STDOUT")
-		size, seekErr := spool.Seek(0, io.SeekCurrent)
-		_ = spool.Close()
-		if copyErr != nil {
-			_ = os.Remove(spool.Name())
-			releaseSpools(spools)
-			return nil, fmt.Errorf("导出 %s: %w", table, copyErr)
-		}
-		if seekErr != nil {
-			_ = os.Remove(spool.Name())
-			releaseSpools(spools)
-			return nil, fmt.Errorf("统计 %s 分节长度: %w", table, seekErr)
-		}
-		header.Tables[table] = tableSection{Rows: tag.RowsAffected(), Bytes: size}
-		spools = append(spools, spool.Name())
+	for i, table := range store.SnapshotTables {
+		header.Tables[table] = tableSection{Rows: sections[i].Rows, Bytes: sections[i].Bytes}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		releaseSpools(spools)
-		return nil, fmt.Errorf("提交导出事务: %w", err)
+	if int64(size) != header.totalBytes() {
+		_ = os.Remove(spool.Name())
+		return nil, fmt.Errorf("数据体 %d 字节与分节声明合计 %d 不符", size, header.totalBytes())
 	}
-	committed = true
-	header.Checksum = hex.EncodeToString(hasher.Sum(nil))
 
 	f.log.Info("快照导出完成",
 		"raft_index", header.RaftIndex, "raft_term", header.RaftTerm,
 		"tables", fmt.Sprint(header.Tables))
-	return &pgSnapshot{header: header, spoolPaths: spools, startedAt: startedAt}, nil
+	return &pgSnapshot{header: header, spoolPath: spool.Name(), startedAt: startedAt}, nil
 }
 
-// releaseSpools 清理已创建的分节临时文件（导出中断时）。
-func releaseSpools(paths []string) {
-	for _, p := range paths {
-		_ = os.Remove(p)
+// totalBytes 返回快照头声明的数据体合计字节数。
+func (h snapshotHeader) totalBytes() int64 {
+	var total int64
+	for _, tbl := range store.SnapshotTables {
+		total += h.Tables[tbl].Bytes
 	}
+	return total
 }
 
 // Restore 先读头与本机进度比对：已追平或超前 → 跳过导入仅消费流；
-// 否则置 Serving 门闩为 false，单事务 TRUNCATE + COPY 导入 + 修正序列，
-// checksum 与行数校验通过才提交；任一不符整体回滚并显式返回错误。
+// 否则置 Serving 门闩为 false，交由存储后端单事务全量导入（行数/checksum/多余字节
+// 校验通过才提交，任一不符整体回滚并显式返回错误）。
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	header, br, err := readSnapshotHeader(rc)
 	if err != nil {
@@ -189,50 +166,14 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 	defer cancel()
 
-	tx, err := f.store.Pool().Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("开启导入事务: %w", err)
+	sections := make([]store.SnapshotSection, 0, len(store.SnapshotTables))
+	for _, table := range store.SnapshotTables {
+		sec := header.Tables[table]
+		sections = append(sections, store.SnapshotSection{Rows: sec.Rows, Bytes: sec.Bytes})
 	}
-	committed := false
-	defer store.RollbackUnlessCommitted(ctx, tx, &committed)()
-
-	if _, err := tx.Exec(ctx, `TRUNCATE biz_configs, biz_config_history, raft_fsm_meta`); err != nil {
-		return fmt.Errorf("清空三表: %w", err)
+	if err := f.store.ImportTables(ctx, br, sections, header.Checksum); err != nil {
+		return err
 	}
-
-	// checksum 覆盖整个数据体：边导入边哈希，提交前比对。
-	hasher := sha256.New()
-	tee := io.TeeReader(br, hasher)
-	for _, table := range snapshotTables {
-		section := header.Tables[table]
-		tag, err := tx.Conn().PgConn().CopyFrom(ctx,
-			io.LimitReader(tee, section.Bytes), "COPY "+table+" FROM STDIN")
-		if err != nil {
-			return fmt.Errorf("导入 %s: %w", table, err)
-		}
-		if tag.RowsAffected() != section.Rows {
-			return fmt.Errorf("导入 %s 行数不符：导入 %d，头声明 %d",
-				table, tag.RowsAffected(), section.Rows)
-		}
-	}
-	if got := hex.EncodeToString(hasher.Sum(nil)); got != header.Checksum {
-		return fmt.Errorf("checksum 不符：数据体可能损坏")
-	}
-	if _, err := br.ReadByte(); err != io.EOF {
-		return fmt.Errorf("数据体之后存在多余字节")
-	}
-	// COPY 携带显式 id 值，序列必须修正到 MAX(id)，否则后续 History 追加撞主键。
-	for _, table := range []string{"biz_configs", "biz_config_history"} {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(
-			`SELECT setval(pg_get_serial_sequence('%s', 'id'),
-			 COALESCE((SELECT MAX(id) FROM %s), 0) + 1, false)`, table, table)); err != nil {
-			return fmt.Errorf("修正 %s 序列: %w", table, err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("提交导入事务: %w", err)
-	}
-	committed = true
 
 	f.mu.Lock()
 	f.lastIndex = header.RaftIndex
@@ -267,7 +208,7 @@ func readSnapshotHeader(r io.Reader) (snapshotHeader, *bufio.Reader, error) {
 	if h.FormatVersion != snapshotFormatVersion {
 		return snapshotHeader{}, nil, fmt.Errorf("不支持的快照格式版本 %d", h.FormatVersion)
 	}
-	for _, table := range snapshotTables {
+	for _, table := range store.SnapshotTables {
 		if _, ok := h.Tables[table]; !ok {
 			return snapshotHeader{}, nil, fmt.Errorf("快照头缺少分节 %s", table)
 		}
