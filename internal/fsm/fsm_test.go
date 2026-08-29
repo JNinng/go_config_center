@@ -140,11 +140,13 @@ func TestFSMRestartSkipsReplayedLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res := apply(t, f2, publishLog(t, 1, 1, t.Name(), "a", "v1", nil)); res.Status != raftlog.StatusReplayed {
-		t.Fatalf("重启后重放 index=1: %+v", res)
+	res1 := apply(t, f2, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+	if res1.Status != raftlog.StatusReplayed || res1.Index != 1 {
+		t.Fatalf("重启后重放 index=1: %+v, want replayed 且携带 index", res1)
 	}
-	if res := apply(t, f2, publishLog(t, 2, 1, t.Name(), "a", "v2", nil)); res.Status != raftlog.StatusReplayed {
-		t.Fatalf("重启后重放 index=2: %+v", res)
+	res2 := apply(t, f2, publishLog(t, 2, 1, t.Name(), "a", "v2", nil))
+	if res2.Status != raftlog.StatusReplayed || res2.Index != 2 {
+		t.Fatalf("重启后重放 index=2: %+v, want replayed 且携带 index", res2)
 	}
 	res := apply(t, f2, publishLog(t, 3, 1, t.Name(), "a", "v3", nil))
 	if res.Status != raftlog.StatusOK || res.Version != 3 {

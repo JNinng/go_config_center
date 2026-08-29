@@ -266,8 +266,19 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	case raftlog.StatusNotFound:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
 	default:
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
+		s.applyFailed(w, res)
 	}
+}
+
+// applyFailed 渲染未被业务语义覆盖的 Apply 结果（DESIGN §4.1）。
+// replayed 说明本节点 PG 进度越过提案日志 index，两份持久化不是同一 lineage，
+// 须按 DESIGN §6.4 重建集群；其余为 FSM 内部错误，透传 FSM 给出的原因。
+func (s *Server) applyFailed(w http.ResponseWriter, res raftlog.Result) {
+	msg := res.Err
+	if res.Status == raftlog.StatusReplayed {
+		msg = fmt.Sprintf("日志 index %d 不大于本节点 FSM 进度——PG 与 Raft 日志非同一 lineage，须按 DESIGN §6.4 重建集群", res.Index)
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": msg})
 }
 
 // propose 将命令提交 Raft 并等待该日志 Apply 完成；提案层失败（无 Leader、超时等）
@@ -337,7 +348,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	case raftlog.StatusNotFound:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
 	default:
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
+		s.applyFailed(w, res)
 	}
 }
 
@@ -393,7 +404,7 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	case raftlog.StatusInvalidRollback:
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "invalid_rollback", "current_version": res.CurrentVersion})
 	default:
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
+		s.applyFailed(w, res)
 	}
 }
 

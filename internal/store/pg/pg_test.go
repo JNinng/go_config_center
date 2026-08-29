@@ -2,8 +2,12 @@ package pg
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
 	"github.com/jninng/go_config_center/internal/testutil"
@@ -587,5 +591,46 @@ func TestListNamespacesDistinctOrdered(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "prod" {
 		t.Fatalf("dev 清空后 namespaces = %v, want [prod]", got)
+	}
+}
+
+// Open 对不存在的库自动建库后重连（DESIGN §6.2），建出的库可直接迁移使用。
+func TestOpenAutoCreatesMissingDatabase(t *testing.T) {
+	adminDSN := testutil.AdminDSN()
+	if adminDSN == "" {
+		t.Skip("GCC_TEST_PG_DSN 未设置，跳过 PG 集成测试")
+	}
+	cfg, err := pgx.ParseConfig(adminDSN)
+	if err != nil {
+		t.Fatalf("解析管理员 DSN: %v", err)
+	}
+	sslmode := "disable"
+	if cfg.TLSConfig != nil {
+		sslmode = "require"
+	}
+	name := fmt.Sprintf("gcc_autocreate_%d_%d", os.Getpid(), time.Now().UnixNano())
+	dsn := fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.User, name, sslmode)
+
+	ctx := context.Background()
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("Open 应自动创建不存在的库 %s: %v", name, err)
+	}
+	defer st.Close()
+	t.Cleanup(func() {
+		admin, err := pgx.Connect(ctx, adminDSN)
+		if err != nil {
+			return
+		}
+		defer admin.Close(ctx)
+		_, _ = admin.Exec(ctx, "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+	})
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if _, _, err := st.LoadMeta(ctx); err != nil {
+		t.Fatalf("LoadMeta: %v", err)
 	}
 }

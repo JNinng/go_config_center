@@ -120,7 +120,7 @@ CREATE TABLE raft_fsm_meta (
 1. Client 向任意节点发写请求。
 2. Follower/候选者不处理写：有 Leader 时返回 **307**（`Location` 指向 Leader，方法与 body 由客户端按 307 语义重发）；无 Leader（选举中）返回 **503 + Retry-After: 1**。
 3. Leader `Propose`，多数派提交，FSM Apply。
-4. 响应：成功 200 + 新 Version；CAS 不匹配 409 + 当前 Version；条目不存在 404。
+4. 响应：成功 200 + 新 Version；CAS 不匹配 409 + 当前 Version；条目不存在 404。其余 Apply 结果为 500 `apply_failed` + 原因：`replayed`（日志 index 不大于本节点 FSM 进度）说明本节点 PG 与 Raft 日志不是同一 lineage，须按 §6.4 重建集群。
 
 Expected Version（CAS）规则，`expected_version` 省略时为 LWW（最后写赢）：
 
@@ -281,6 +281,9 @@ config-center --config config.yaml
 ```
 
 启动顺序：读配置 → 加载/生成 node-id → 连 PG 并确保 schema → 打开 Raft（boltdb 日志 + 文件快照 + TCP 传输）→ 非 bootstrap 节点执行发现与 Join → Serving。
+
+- `pg_dsn` 指向的库不存在时经维护库 postgres 自动创建（要求连接账号具备 CREATEDB 权限），schema 随后照常迁移。
+- **lineage 护栏**：本节点 `raft_fsm_meta.last_applied_index` 越过本地 Raft 日志末端 index 时拒绝启动——两份持久化不是同一 lineage，继续运行会静默丢弃全部新写；恢复须按 §6.4。
 
 ### 6.3 部署拓扑
 

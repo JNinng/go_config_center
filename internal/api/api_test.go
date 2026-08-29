@@ -219,6 +219,50 @@ func TestDeleteEndpoint(t *testing.T) {
 	}
 }
 
+// apply_failed 语义（DESIGN §4.1）：replayed 携带 lineage 错位说明与日志 index，
+// 其余失败透传 FSM 给出的原因，不得出现空 message。
+func TestApplyFailedMappingCarriesReason(t *testing.T) {
+	st := mustStore(t)
+
+	do := func(t *testing.T, p Proposer) map[string]any {
+		t.Helper()
+		ts := httptest.NewServer(New(Deps{Proposer: p, Store: st, Hub: watch.NewHub(), AdminToken: "tok", Ready: func() bool { return true }}).Routes())
+		defer ts.Close()
+		sub, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(sub, http.MethodPut, ts.URL+"/v1/namespaces/dev/configs/a",
+			strings.NewReader(`{"content":"v","data_type":"TEXT","expected_version":1}`))
+		req.Header.Set("Authorization", "Bearer tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("apply 失败 = %d, want 500", resp.StatusCode)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
+	body := do(t, fakeProposer{res: raftlog.Result{Status: raftlog.StatusReplayed, Index: 23}})
+	if body["error"] != "apply_failed" {
+		t.Fatalf("body = %v, want error=apply_failed", body)
+	}
+	msg, _ := body["message"].(string)
+	if !strings.Contains(msg, "23") || !strings.Contains(msg, "lineage") {
+		t.Fatalf("replayed message = %q, want 含日志 index 与 lineage 指引", msg)
+	}
+
+	body = do(t, fakeProposer{res: raftlog.Result{Status: raftlog.StatusError, Err: "载荷非法"}})
+	if body["message"] != "载荷非法" {
+		t.Fatalf("error message = %v, want 透传 FSM 原因", body["message"])
+	}
+}
+
 // versions 端点（DESIGN §5.1）：倒序、limit/before_version 分页、Tombstone content 为 null。
 func TestVersionsEndpoint(t *testing.T) {
 	st := mustStore(t)

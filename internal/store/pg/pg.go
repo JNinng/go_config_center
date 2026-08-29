@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jninng/go_config_center/internal/raftlog"
 	"github.com/jninng/go_config_center/internal/store"
@@ -61,7 +63,34 @@ type Store struct {
 }
 
 // Open 连接 PostgreSQL（连接池）并返回存储实现。
+// 目标库不存在（SQLSTATE 3D000）时经维护库 postgres 自动创建后重连（DESIGN §6.2），
+// 要求连接账号具备 CREATEDB 权限，无权限则报错退出。
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	pool, err := dial(ctx, dsn)
+	if err == nil {
+		return &Store{pool: pool}, nil
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "3D000" {
+		return nil, fmt.Errorf("连接 PG: %w", err)
+	}
+	name, err := databaseName(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("连接 PG: %w", err)
+	}
+	if err := createDatabase(ctx, dsn, name); err != nil {
+		return nil, fmt.Errorf("PG 库 %q 不存在且自动创建失败（账号需 CREATEDB 权限）: %w", name, err)
+	}
+	slog.Warn("PG 目标库不存在，已自动创建", "database", name)
+	pool, err = dial(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("连接 PG: %w", err)
+	}
+	return &Store{pool: pool}, nil
+}
+
+// dial 建立连接池并 Ping 验证；错误保留 pgconn.PgError 于错误链中供 SQLSTATE 判别。
+func dial(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("创建 PG 连接池: %w", err)
@@ -70,9 +99,41 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	defer cancel()
 	if err := pool.Ping(pingCtx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("连接 PG: %w", err)
+		return nil, err
 	}
-	return &Store{pool: pool}, nil
+	return pool, nil
+}
+
+// databaseName 从 DSN 解析目标库名；未显式指定时按 PostgreSQL 惯例回落为用户名。
+func databaseName(dsn string) (string, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", fmt.Errorf("解析 DSN: %w", err)
+	}
+	if cfg.Database != "" {
+		return cfg.Database, nil
+	}
+	return cfg.User, nil
+}
+
+// createDatabase 经同一 DSN 的维护库 postgres 执行 CREATE DATABASE。
+func createDatabase(ctx context.Context, dsn, name string) error {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("解析 DSN: %w", err)
+	}
+	cfg.Database = "postgres"
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(cctx, cfg)
+	if err != nil {
+		return fmt.Errorf("连接维护库 postgres: %w", err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(cctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		return fmt.Errorf("CREATE DATABASE: %w", err)
+	}
+	return nil
 }
 
 // Close 关闭连接池。

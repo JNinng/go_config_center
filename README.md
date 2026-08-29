@@ -26,6 +26,8 @@ cp config.example.yaml config.yaml
 ./config-center --config config.yaml --bootstrap   # 全新集群仅首节点执行一次
 ```
 
+`pg_dsn` 指向的库不存在时会自动创建（要求连接账号具备 CREATEDB 权限）；若本节点 PG 进度与 Raft 日志不属于同一 lineage，启动时护栏会拒绝并指路 DESIGN §6.4。
+
 ### 三节点集群（docker compose）
 
 ```bash

@@ -98,6 +98,19 @@ func main() {
 		fatal(logger, "构造 FSM", err)
 	}
 
+	// lineage 护栏（DESIGN §6.2）：PG 物化进度不得越过 Raft 日志末端——越过说明
+	// 两份持久化不是同一 lineage（如 PG 未按 §6.4 置零就重置了 data_dir），继续运行
+	// 时一切新日志都会命中跳过式重放，写被静默丢弃，故启动即拒绝。
+	metaIdx, _ := machine.LastApplied()
+	raftLastIdx, err := boltStore.LastIndex()
+	if err != nil {
+		fatal(logger, "读取 Raft 日志末端", err)
+	}
+	if metaIdx > raftLastIdx {
+		fatal(logger, "本节点持久化状态不一致（PG 进度越过 Raft 日志末端）", fmt.Errorf(
+			"raft_fsm_meta.last_applied_index=%d > Raft 日志末端 index=%d，两份数据不是同一 lineage，须按 DESIGN §6.4 重建集群", metaIdx, raftLastIdx))
+	}
+
 	raftCfg := raft.DefaultConfig()
 	raftCfg.LocalID = raft.ServerID(nodeID)
 	raftCfg.SnapshotThreshold = cfg.Raft.SnapshotThreshold

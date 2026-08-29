@@ -68,11 +68,12 @@ type FSM struct {
 	// 读 API 返回 503 + Retry-After，/readyz 为 not ready。
 	serving atomic.Bool
 
-	mu         sync.Mutex
-	lastIndex  uint64
-	lastTerm   uint64
-	results    map[uint64]raftlog.Result
-	resultKeep uint64
+	mu            sync.Mutex
+	lastIndex     uint64
+	lastTerm      uint64
+	results       map[uint64]raftlog.Result
+	resultKeep    uint64
+	replayWarned  sync.Once
 }
 
 // New 构造 FSM 并从存储后端恢复进度。hub 为本机 Watch 唤醒源（DESIGN §4.3），可为 nil。
@@ -109,7 +110,13 @@ func (f *FSM) Apply(l *raft.Log) interface{} {
 		if ok {
 			return res
 		}
-		return raftlog.Result{Status: raftlog.StatusReplayed}
+		// 正常重启重放（追赶已应用日志）也走这里，只告警一次避免刷屏；
+		// 持续出现则说明 PG 进度越过 Raft 日志末端，启动护栏（DESIGN §6.2）应已拦截。
+		f.replayWarned.Do(func() {
+			f.log.Warn("命中跳过式重放：日志 index 不大于 last_applied 且无缓存结果",
+				"index", l.Index, "last_applied", f.lastIndex)
+		})
+		return raftlog.Result{Status: raftlog.StatusReplayed, Index: l.Index}
 	}
 
 	started := time.Now()

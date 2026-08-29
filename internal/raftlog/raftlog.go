@@ -222,10 +222,11 @@ const (
 // Result 由 FSM.Apply 返回，经 ApplyFuture 回传给 API 层映射为 200/409/404。
 type Result struct {
 	Status         Status
-	Version        int64 // ok 时新分配的 Version
-	CurrentVersion int64 // version_conflict 时条目当前 Version
-	Created        bool  // ok 时是否为新建（此前无存活条目）
-	Err            string
+	Version        int64  // ok 时新分配的 Version
+	CurrentVersion int64  // version_conflict 时条目当前 Version
+	Created        bool   // ok 时是否为新建（此前无存活条目）
+	Err            string // 非 ok 时的补充说明
+	Index          uint64 // replayed 时命中的日志 index，供上层定位 lineage 错位
 }
 
 func OK(version int64, created bool) Result {

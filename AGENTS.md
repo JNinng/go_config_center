@@ -27,6 +27,7 @@ bash scripts/build-console.sh   # 控制台：前端构建（需 node）+ go bui
 - **Rollback 的 to_version 在 FSM Apply 阶段解析**，API 层不预取（避免 TOCTOU）。
 - History 只追加；Delete 写 Tombstone 并消耗版本号；版本按 `(namespace, data_id)` 单调。
 - 写路径只能经 Raft 提案；读路径读本机 PG（允许陈旧，无 ReadIndex，见 ADR-0003）。
+- **lineage 护栏（DESIGN §6.2）**：本节点 PG 进度不得越过本地 Raft 日志末端，main.go 启动时校验，越界即拒绝启动（继续运行会静默吞写）；`pg_dsn` 指向的库不存在时由 `pg.Open` 自动创建。
 
 ## 约定
 
