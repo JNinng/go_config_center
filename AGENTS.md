@@ -7,14 +7,14 @@
 - `cmd/config-center/` — 单二进制入口：装配、自退出循环（退出码 42）、移除护栏、指标采集
 - `internal/` — `api`（HTTP）、`store`（存储契约接口）、`store/pg`（PostgreSQL 实现）、`fsm`（Raft FSM + 快照）、`raftlog`（日志信封）、`discovery`（发现代理）、`watch`、`config`、`nodeid`、`testutil`
 - `docs/DESIGN.md` — 设计契约，代码注释以 § 编号引用它；`docs/adr/` — 决策理由；`CONTEXT.md` — 术语表（**先读**）
-- `scripts/e2e_ticketNN.sh` — 各票 e2e 验收；`.scratch/config-center-mvp/issues/` — 票档（过程记录归档）
+- `scripts/` — e2e 验收套件（`_test.go` + `//go:build e2e`，每张 `TestTicketNN` 对应一张票；黑盒，不 import `internal/*`，永不进生产二进制）；`.scratch/config-center-mvp/issues/` — 票档（过程记录归档）
 
 ## 命令
 
 ```bash
 go build ./... && go vet ./...
 go test ./...        # PG 集成测试需 GCC_TEST_PG_DSN（管理员 DSN），未设置时自动跳过
-bash scripts/e2e_ticket09.sh   # e2e 需本地 PG（psql -U postgresql 可用）+ 已构建二进制
+go test -tags e2e ./scripts -run TestTicket09 -v -count=1   # e2e 需本地 PG（psql -U postgresql 可用），全量跑 -run TestTicket
 ```
 
 ## 不变量（改代码前必读）
@@ -39,5 +39,5 @@ bash scripts/e2e_ticket09.sh   # e2e 需本地 PG（psql -U postgresql 可用）
 
 - raft-boltdb 会经 stdlib log 打良性噪音 `Rollback failed: tx closed`，main.go 的 `noiseFilter` 定向丢弃——不要"修"它。
 - `ShutdownOnRemove` 仅在本节点**作为 Leader 提交了不含自身的成员表**时触发（即移除 Leader 场景）；移除 Follower 依赖 main.go 的 2s `cluster/status` 核对循环以退出码 42 退出，e2e 断言此码。
-- 开发环境为 Windows + Git Bash；e2e 脚本是 bash；仓库根的 `data*/`、`config-center.exe`、`config.yaml` 为本地运行产物，勿提交勿清理。
+- 开发环境为 Windows + Git Bash；e2e 是 `scripts` 包的 Go 测试（`-tags e2e` 才参与编译；票 10/11 挂起进程经 PowerShell）；仓库根的 `data*/`、`config-center.exe`、`config.yaml` 为本地运行产物，勿提交勿清理。
 - Leader HTTP 地址缓存绑定获知时的 Leader Raft 地址（main.go `cachedForLeader`）：Leader 更换后旧缓存立即失效为 503，由发现代理 5s 刷新恢复 307——改动重定向逻辑前先理解此设计（DESIGN §4.1）。
