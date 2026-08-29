@@ -173,7 +173,7 @@ Serving 门闩为进程内原子布尔；false 期间所有读 API 返回 **503 
 
 **Join**：新节点/重连节点启动后扫描 Seed List（排除自身地址），逐个调 `GET /internal/discovery`：对方为 Leader → 向其 `POST /v1/cluster/join`；对方为 Follower → 从响应取 Leader 地址再试。全部不可达 → 指数退避重试，永不自举、不退出。Leader 收到 Join 后 `AddVoter`，接口幂等（已是成员 → 200）。注：直接以 voter 身份加入——hashicorp/raft 的 staging 自动转正从未实现（membership.md 仅提案未落地），显式 voter 加入与 Consul 等生产用法一致。
 
-**Remove**：`DELETE /v1/cluster/peers/{node_id}`，执行前护栏校验——**移除后所需 quorum 必须不大于剩余在线 voter 数**，不满足返回 409（Raft 库不提供此保护）。被移除节点观察到自身 Raft 进入 Shutdown 后以专用退出码（`EXIT_REMOVED = 42`）退出进程；部署单元将该退出码配置为不自动重启。
+**Remove**：`DELETE /v1/cluster/peers/{node_id}`，执行前护栏校验——**移除后所需 quorum 必须不大于剩余在线 voter 数**，不满足返回 409（Raft 库不提供此保护）。被移除节点以专用退出码（`EXIT_REMOVED = 42`）退出进程，双路径触发：① 库收到不含自身的新配置时自动 Shutdown（`ShutdownOnRemove`，通常发生在换主后）；② Leader 未变更时被移除节点收不到任何 raft 消息——各节点周期（2s）向 Leader 的 `cluster/status` 主动核对成员表，自身缺席即退出；核对失败不退出（保守方向）。部署单元将该退出码配置为不自动重启。
 
 **换 IP**：运维流程 = Leader 上移除旧成员（护栏校验）→ 节点清空 `data_dir`、以新 Node ID 重新 Join（快照 + 日志追平，分钟级）。
 
