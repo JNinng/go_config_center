@@ -14,6 +14,7 @@ import (
 
 func TestTicket04(t *testing.T) {
 	begin(t)
+	cfg := singleNodeConfig(t)
 	const port = 8080
 	const ns, id = "dev", "db.password"
 	entryPath := fmt.Sprintf("/v1/namespaces/%s/configs/%s", ns, id)
@@ -26,7 +27,7 @@ func TestTicket04(t *testing.T) {
 	os.RemoveAll("data")
 	dropTables(t, pgDB)
 
-	n := startNode(t, "config.yaml", true, ticketLog(t, "04-n1.log"))
+	n := startNode(t, cfg, true, ticketLog(t, "04-n1.log"))
 	if !waitHealth(port, 6*time.Second) {
 		t.Fatal("节点未就绪")
 	}

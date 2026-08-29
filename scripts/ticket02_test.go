@@ -29,6 +29,7 @@ type snapHeader struct {
 
 func TestTicket02(t *testing.T) {
 	begin(t)
+	cfg := singleNodeConfig(t)
 	const port = 8080
 	const ns = "dev"
 	log1 := ticketLog(t, "02-n1.log")
@@ -39,7 +40,7 @@ func TestTicket02(t *testing.T) {
 	section("准备：清空 data 目录与 PG 表，bootstrap 单节点")
 	os.RemoveAll("data")
 	dropTables(t, pgDB)
-	n := startNode(t, "config.yaml", true, log1)
+	n := startNode(t, cfg, true, log1)
 	check(t, waitHealth(port, 6*time.Second), "单节点 bootstrap 启动")
 
 	section("写入 4 条日志：a×2 版本、b、c")
@@ -78,7 +79,7 @@ func TestTicket02(t *testing.T) {
 	n.kill()
 	time.Sleep(500 * time.Millisecond)
 	start := time.Now()
-	n = startNode(t, "config.yaml", false, log1)
+	n = startNode(t, cfg, false, log1)
 	waitHealth(port, 6*time.Second)
 	ms := time.Since(start).Milliseconds()
 	check(t, ms <= 3000, "重启到 HTTP 可服务 %dms ≤3s", ms)
@@ -94,7 +95,7 @@ func TestTicket02(t *testing.T) {
 	n.kill()
 	time.Sleep(500 * time.Millisecond)
 	dropTables(t, pgDB)
-	n = startNode(t, "config.yaml", false, log1)
+	n = startNode(t, cfg, false, log1)
 	check(t, waitHealth(port, 30*time.Second), "清空 PG 后重启成功（Migrate 重建 + Restore 全量导入）")
 	check(t, fileContains(t, log1, "全量导入完成"), "日志命中全量导入路径")
 	check(t, waitCond(10*time.Second, 100*time.Millisecond, func() bool { return entryReadable(port, ns, "d") }),
@@ -121,7 +122,7 @@ func TestTicket02(t *testing.T) {
 	if err := os.WriteFile(snapFile, corrupted, 0o644); err != nil {
 		t.Fatalf("写入损坏快照: %v", err)
 	}
-	rc, out := runForeground(t, "--config", "config.yaml")
+	rc, out := runForeground(t, "--config", cfg)
 	check(t, rc != 0, "快照损坏时进程非零退出（rc=%d）", rc)
 	failureEvidence := regexp.MustCompile(`checksum 不符|failed to restore|failed to load any existing snapshots|CRC mismatch`).FindString(out)
 	check(t, failureEvidence != "", "错误信息指出恢复失败（%s）", trunc(failureEvidence))
@@ -132,7 +133,7 @@ func TestTicket02(t *testing.T) {
 	}
 
 	section("验收 5：还原快照后服务正常可写可读")
-	n = startNode(t, "config.yaml", false, log1)
+	n = startNode(t, cfg, false, log1)
 	check(t, waitHealth(port, 6*time.Second), "还原快照后重启成功")
 	check(t, waitCond(10*time.Second, 100*time.Millisecond, func() bool { return entryReadable(port, ns, "e") }), "重放完成后 e 可读")
 	check(t, publish(port, ns, "f", "v1"), "重启后继续可写")

@@ -2,7 +2,8 @@
 
 本目录是 [DESIGN §8 验证策略](../docs/DESIGN.md) 的可执行部分：每个 `TestTicketNN`
 对应 [.scratch/config-center-mvp/issues/](../.scratch/config-center-mvp/issues/) 里的一张票，
-逐项断言该票的验收条件。全部测试可重复执行——每次运行自行清理数据目录并重建库/表。
+逐项断言该票的验收条件。全部测试可重复执行——开始前自行清场，结束后（含失败）
+自动清空 data 目录与测试库，不在仓库与 PG 里留任何足迹。
 
 ## 形态与构建隔离
 
@@ -11,8 +12,9 @@
   验收代码不会进入任何生产二进制。
 - 黑盒测试：只经 HTTP API、`psql` 与被测二进制交互，不 import `internal/*`。
 - `TestMain` 把工作目录切到仓库根并构建 `./config-center.exe`；单节点组
-  （票 01~05、07）使用仓库根 [config.yaml](../config.yaml) 与 `data/` 数据目录、
-  库 `config_center_1`。
+  （票 01~05、07）与多节点组一样使用套件生成的临时配置（`%TMP%/gcc-e2e-go/`），
+  data 目录为仓库根 `data/`、库 `config_center_1`。仓库根 config.yaml 不被套件
+  读取或改动，用户本地配置与测试足迹互不污染。
 
 ## 前置条件
 
@@ -33,6 +35,9 @@ go test -tags e2e ./scripts -run TestTicket -v -count=1     # 全部票按序执
 
 - `-count=1` 为双保险：`begin()` 里的 `t.Setenv` 已禁用 go test 对本包的结果缓存，
   这些副作用测试每次都必须真跑。
+- **收场清理**：每张票结束（含失败）自动删除 `data/`、`data-1/2/3` 目录并
+  `DROP DATABASE` 测试库（`config_center_1..4`）。要保留现场排查时用
+  `GCC_E2E_KEEP=1` 前缀跳过清理。
 - 多节点组为脚本生成的临时配置（`%TMP%/gcc-e2e-go/`）、数据目录 `data-1/2/3`、
   库 `config_center_1/2/3`。多节点拓扑是本机 1 PG + 多库 + 多进程的等价拓扑
   （DESIGN §6.3 的 docker-compose 三节点版本见仓库根，套件不依赖 Docker）。
@@ -64,12 +69,11 @@ go test ./internal/fsm   # TestFSMPropertyReplayDeterminism：随机日志序列
 
 ## 想直接看 raft 快照文件
 
-- **票 02** 展示快照文件的内部结构并独立校验 checksum；
-- **票 11** 展示快照的保留清理与 InstallSnapshot 传输链路。
-
-套件跑完后可肉眼检查（以票 02 留下的 `data/` 为例）：
+票 02/11 会在 PASS 行里解析并校验快照结构（magic/JSON 头/三表行数/checksum）。
+要肉眼检查文件本体，用 `GCC_E2E_KEEP=1` 保留现场（以票 02 为例）：
 
 ```bash
+GCC_E2E_KEEP=1 go test -tags e2e ./scripts -run TestTicket02 -v -count=1
 ls -lt data/raft/snapshots/                            # 每个快照一个目录
 cat data/raft/snapshots/*/meta.json                    # raft 层元数据（Term/Index/Configuration 成员表）
 tail -c +9 data/raft/snapshots/*/state.bin | head -1   # FSM 快照 JSON 头（跳过 8B magic）
@@ -77,6 +81,7 @@ tail -c +9 data/raft/snapshots/*/state.bin | head -1   # FSM 快照 JSON 头（�
 
 `state.bin` 是 GCCSNP01 格式的 FSM 快照（三张业务表数据体，格式见 DESIGN §4.4）；
 成员表不在其中——它在 `meta.json` 的 `Configuration` 字段，属 raft 自带状态。
+检查完毕删掉 `data/` 即可（或留着，下次运行开始前的清场会处理）。
 
 ## 排错
 

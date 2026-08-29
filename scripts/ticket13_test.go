@@ -16,6 +16,7 @@ import (
 
 func TestTicket13(t *testing.T) {
 	begin(t)
+	cfg := singleNodeConfig(t)
 	const port = 8080
 	const ns = "console-demo"
 	log1 := ticketLog(t, "13-n1.log")
@@ -25,7 +26,7 @@ func TestTicket13(t *testing.T) {
 	dropTables(t, pgDB)
 
 	section("准备：--bootstrap 拉起单节点")
-	n := startNode(t, "config.yaml", true, log1)
+	n := startNode(t, cfg, true, log1)
 	if !waitHealth(port, 6*time.Second) {
 		t.Fatal("节点未在 6s 内就绪")
 	}

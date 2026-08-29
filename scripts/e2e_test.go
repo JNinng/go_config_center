@@ -15,6 +15,9 @@
 //   - 前置条件：本机 PostgreSQL（psql -U postgresql 免密）、票 10/11 需 PowerShell
 //     （挂起/恢复进程）、空闲端口 HTTP 8080~8083 与 Raft 7946~7949。
 //   - 节点日志在 %TMP%/gcc-e2e-go/，按"票号-节点"命名。
+//   - 收场清理：每张票结束（含失败）由 begin 注册的 clearFixtures 清空全部 data
+//     目录与测试库（config_center_1..4）；GCC_E2E_KEEP=1 可跳过清理保留现场。
+//     单节点组的配置由套件生成（singleNodeConfig），仓库根 config.yaml 不被读取或改动。
 package e2e
 
 import (
@@ -50,6 +53,11 @@ var (
 	// clientFollow 跟随重定向（等价 curl -L）。
 	clientFollow = &http.Client{}
 	logDir       = filepath.Join(os.TempDir(), "gcc-e2e-go")
+
+	// fixtureDataDirs 与 fixtureDBs 是套件的全部持久化足迹：每张票结束清空，
+	// 不让遗留 lineage 泄入下一次运行。
+	fixtureDataDirs = []string{"data", "data-1", "data-2", "data-3", "data-4"}
+	fixtureDBs      = []string{"config_center_1", "config_center_2", "config_center_3", "config_center_4"}
 )
 
 func TestMain(m *testing.M) {
@@ -83,10 +91,64 @@ func section(format string, args ...any) {
 	fmt.Printf("=== %s ===\n", fmt.Sprintf(format, args...))
 }
 
-// begin 每张票的测试入口先调用：t.Setenv 使 go test 永不缓存本包结果。
+// begin 每张票的测试入口先调用：t.Setenv 使 go test 永不缓存本包结果；并注册
+// 收场清理（clearFixtures）——t.Cleanup 为 LIFO，各 startProc 的进程强杀先执行，
+// 再清 data 目录与 PG 库，票失败同样清场。GCC_E2E_KEEP=1 跳过清理保留现场排查。
 func begin(t *testing.T) {
 	t.Helper()
 	t.Setenv("GCC_E2E_TICKET", t.Name())
+	if os.Getenv("GCC_E2E_KEEP") == "" {
+		t.Cleanup(func() { clearFixtures(t) })
+	}
+}
+
+// clearFixtures 清空套件足迹：data 目录与测试库。Windows 下进程退出后句柄释放
+// 可能滞后，目录删除带重试；清理失败仅告警不倒灌 FAIL——下次运行的准备阶段
+// （RemoveAll/dropTables/recreateDBs）兜底。
+func clearFixtures(t *testing.T) {
+	t.Helper()
+	for _, dir := range fixtureDataDirs {
+		var err error
+		for range 5 {
+			if err = os.RemoveAll(dir); err == nil {
+				break
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+		if err != nil {
+			fmt.Printf("WARN: 清理 %s: %v\n", dir, err)
+		}
+	}
+	for _, db := range fixtureDBs {
+		dropFixtureDB(t, db)
+	}
+	section("收场清理：data 目录与测试库已清空")
+}
+
+// dropFixtureDB 删除单个测试库；不存在为幂等空操作。
+func dropFixtureDB(t *testing.T, db string) {
+	if _, err := psql("postgres", "DROP DATABASE IF EXISTS "+db+" WITH (FORCE)"); err != nil {
+		fmt.Printf("WARN: 清理 PG 库 %s: %v\n", db, err)
+	}
+}
+
+// singleNodeConfig 生成单节点组的临时配置（http 8080 / raft 7946 / data 目录 data/
+// / 库 config_center_1），与多节点组同机制——套件不读写仓库根 config.yaml，
+// 用户本地配置与测试足迹互不污染。
+func singleNodeConfig(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(logDir, "config-single.yaml")
+	var b strings.Builder
+	fmt.Fprintf(&b, "http_addr: \"127.0.0.1:8080\"\n")
+	fmt.Fprintf(&b, "raft_addr: \"127.0.0.1:7946\"\n")
+	fmt.Fprintf(&b, "data_dir: \"./data\"\n")
+	fmt.Fprintf(&b, "admin_token: %q\n", adminToken)
+	fmt.Fprintf(&b, "pg_dsn: \"host=127.0.0.1 port=5432 user=postgresql dbname=%s sslmode=disable\"\n", pgDB)
+	fmt.Fprintf(&b, "http_advertise: \"http://127.0.0.1:8080\"\n")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("写配置 %s: %v", path, err)
+	}
+	return path
 }
 
 func finish(t *testing.T) {
@@ -159,9 +221,13 @@ func psqlQ(t *testing.T, db, query string) string {
 	return out
 }
 
-// dropTables 清空单节点组的库表（等价 DROP TABLE IF EXISTS ... CASCADE）。
+// dropTables 清空单节点组的库表（等价 DROP TABLE IF EXISTS ... CASCADE）；
+// 库本身不存在（被上轮收场清理删去）则无事可清，直接返回。
 func dropTables(t *testing.T, db string) {
 	t.Helper()
+	if out, err := psql("postgres", "SELECT 1 FROM pg_database WHERE datname='"+db+"'"); err != nil || out != "1" {
+		return
+	}
 	if _, err := psql(db, "DROP TABLE IF EXISTS biz_configs, biz_config_history, raft_fsm_meta CASCADE"); err != nil {
 		t.Fatalf("清空 %s 表: %v", db, err)
 	}

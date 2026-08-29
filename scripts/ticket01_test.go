@@ -14,6 +14,7 @@ import (
 
 func TestTicket01(t *testing.T) {
 	begin(t)
+	cfg := singleNodeConfig(t)
 	const port = 8080
 	const ns, id = "dev", "db.password"
 	log1 := ticketLog(t, "01-n1.log")
@@ -27,7 +28,7 @@ func TestTicket01(t *testing.T) {
 
 	section("验收 6 + 1：--bootstrap 拉起单节点，空库启动到 HTTP 可服务 ≤3s")
 	start := time.Now()
-	n := startNode(t, "config.yaml", true, log1)
+	n := startNode(t, cfg, true, log1)
 	if !waitHealth(port, 6*time.Second) {
 		t.Fatal("节点未在 6s 内就绪")
 	}
@@ -79,7 +80,7 @@ func TestTicket01(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	check(t, !healthOK(port), "进程已被杀死")
 
-	n = startNode(t, "config.yaml", false, log1)
+	n = startNode(t, cfg, false, log1)
 	if !waitHealth(port, 6*time.Second) {
 		t.Fatal("重启后节点未就绪")
 	}
@@ -98,7 +99,7 @@ func TestTicket01(t *testing.T) {
 	section("验收 1（后半）：对已有集群态再次 --bootstrap 报错退出")
 	n.kill()
 	time.Sleep(500 * time.Millisecond)
-	rc, out := runForeground(t, "--config", "config.yaml", "--bootstrap")
+	rc, out := runForeground(t, "--config", cfg, "--bootstrap")
 	check(t, rc != 0, "再次 --bootstrap 非零退出（rc=%d）", rc)
 	check(t, strings.Contains(out, "已存在集群状态"), "错误信息明确指出已有集群状态")
 

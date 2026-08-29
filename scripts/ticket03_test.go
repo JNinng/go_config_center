@@ -23,6 +23,7 @@ func versionSeq(t *testing.T, r httpResult) []int64 {
 
 func TestTicket03(t *testing.T) {
 	begin(t)
+	cfg := singleNodeConfig(t)
 	const port = 8080
 	const ns, id = "dev", "db.password"
 	path := func(dataID string) string { return fmt.Sprintf("/v1/namespaces/%s/configs/%s", ns, dataID) }
@@ -35,7 +36,7 @@ func TestTicket03(t *testing.T) {
 	dropTables(t, pgDB)
 
 	section("启动单节点")
-	n := startNode(t, "config.yaml", true, ticketLog(t, "03-n1.log"))
+	n := startNode(t, cfg, true, ticketLog(t, "03-n1.log"))
 	if !waitHealth(port, 6*time.Second) {
 		t.Fatal("节点未就绪")
 	}
