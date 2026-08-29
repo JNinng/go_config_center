@@ -634,3 +634,65 @@ func TestOpenAutoCreatesMissingDatabase(t *testing.T) {
 		t.Fatalf("LoadMeta: %v", err)
 	}
 }
+
+// 删除 Namespace（DESIGN §5.1）：单事务删光存活条目并各写 Tombstone（墓碑版本 =
+// 当前版本+1）、进度推进、Namespace 移出清单；空 Namespace 幂等；删后可逐条回滚重建。
+func TestApplyDeleteNamespace(t *testing.T) {
+	st, dsn := mustOpen(t)
+	ctx := context.Background()
+	ns := t.Name()
+	if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v1", nil), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v2", nil), 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyPublish(ctx, pub(ns, "b", "x", nil), 3, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := st.ApplyDeleteNamespace(ctx, raftlog.DeleteNamespaceData{Namespace: ns, Actor: "admin"}, 4, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != raftlog.StatusOK || res.Entries != 2 {
+		t.Fatalf("result = %+v, want ok entries=2", res)
+	}
+	byID := map[string]int64{}
+	for _, e := range res.Deleted {
+		byID[e.DataId] = e.Version
+	}
+	if byID["a"] != 3 || byID["b"] != 2 {
+		t.Fatalf("墓碑版本 = %v, want a=3（v2+1）b=2（v1+1）", byID)
+	}
+
+	if n := testutil.QueryInt(t, dsn, "SELECT count(*) FROM biz_configs WHERE namespace=$1", ns); n != 0 {
+		t.Fatalf("biz_configs 剩余 %d 行, want 0", n)
+	}
+	if n := testutil.QueryInt(t, dsn,
+		"SELECT count(*) FROM biz_config_history WHERE namespace=$1 AND op='delete' AND content IS NULL", ns); n != 2 {
+		t.Fatalf("Tombstone 行数 = %d, want 2", n)
+	}
+	if namespaces, err := st.ListNamespaces(ctx); err != nil || len(namespaces) != 0 {
+		t.Fatalf("删除后 namespaces = %v %v, want 空（无存活条目）", namespaces, err)
+	}
+	if idx, _, _ := st.LoadMeta(ctx); idx != 4 {
+		t.Fatalf("meta index = %d, want 4", idx)
+	}
+
+	// 幂等：再次删除空 Namespace。
+	res, err = st.ApplyDeleteNamespace(ctx, raftlog.DeleteNamespaceData{Namespace: ns}, 5, 1)
+	if err != nil || res.Status != raftlog.StatusOK || res.Entries != 0 {
+		t.Fatalf("重复删除 = %+v %v, want ok entries=0", res, err)
+	}
+
+	// 可回滚：对 a 回滚到墓碑之前的 v1，条目重建。
+	res, err = st.ApplyRollback(ctx, rb(ns, "a", 1), 6, 1)
+	if err != nil || res.Status != raftlog.StatusOK || !res.Created {
+		t.Fatalf("删除后回滚重建 = %+v %v, want ok created v4", res, err)
+	}
+	entry, err := st.GetEntry(ctx, ns, "a")
+	if err != nil || entry == nil || entry.Content != "v1" || entry.Version != 4 {
+		t.Fatalf("重建条目 = %+v %v, want v1 @ v4", entry, err)
+	}
+}

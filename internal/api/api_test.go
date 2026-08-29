@@ -1089,3 +1089,76 @@ func TestConsoleMountDoesNotShadowAPI(t *testing.T) {
 		t.Fatalf("POST /not-registered = %d, want 405", resp.StatusCode)
 	}
 }
+
+// 删除 Namespace 端点（DESIGN §5.1）：认证、成功 200 entries、Apply 失败 500、Follower 307。
+func TestDeleteNamespaceEndpoint(t *testing.T) {
+	st := mustStore(t)
+	do := func(t *testing.T, p Proposer, info ClusterInfo, auth, url string) *http.Response {
+		t.Helper()
+		ts := httptest.NewServer(New(Deps{Proposer: p, Store: st, AdminToken: "tok",
+			Ready: func() bool { return true }, ClusterInfo: func() ClusterInfo { return info }}).Routes())
+		defer ts.Close()
+		req, _ := http.NewRequest(http.MethodDelete, ts.URL+url, nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+	leader := ClusterInfo{NodeID: "n1", Role: "leader", LeaderHTTP: "http://n1:8080"}
+
+	resp := do(t, fakeProposer{}, leader, "", "/v1/namespaces/dev")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("无认证 = %d, want 401", resp.StatusCode)
+	}
+
+	resp = do(t, fakeProposer{res: raftlog.Result{Status: raftlog.StatusOK, Entries: 3}}, leader, "Bearer tok", "/v1/namespaces/dev")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("删除 = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		Status  string `json:"status"`
+		Entries int64  `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Status != "deleted" || body.Entries != 3 {
+		t.Fatalf("body = %+v, want deleted entries=3", body)
+	}
+
+	resp = do(t, fakeProposer{res: raftlog.Result{Status: raftlog.StatusOK, Entries: 0}}, leader, "Bearer tok", "/v1/namespaces/empty")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("删空 ns = %d, want 200", resp.StatusCode)
+	}
+	body = struct {
+		Status  string `json:"status"`
+		Entries int64  `json:"entries"`
+	}{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Entries != 0 {
+		t.Fatalf("删空 ns entries = %d, want 0（幂等）", body.Entries)
+	}
+
+	resp = do(t, fakeProposer{res: raftlog.Result{Status: raftlog.StatusError, Err: "boom"}}, leader, "Bearer tok", "/v1/namespaces/dev")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("apply 失败 = %d, want 500", resp.StatusCode)
+	}
+
+	resp = do(t, fakeProposer{}, ClusterInfo{Role: "follower", LeaderHTTP: "http://n1:8080"}, "Bearer tok", "/v1/namespaces/dev")
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("follower 删除 = %d, want 307", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "http://n1:8080/v1/namespaces/dev" {
+		t.Fatalf("Location = %q, want 指向 Leader 且保留路径", loc)
+	}
+}

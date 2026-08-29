@@ -178,6 +178,24 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		metrics.applyResults.WithLabelValues(string(res.Status)).Inc()
 		return res, raftlog.OpRollback
 
+	case raftlog.OpDeleteNamespace:
+		data, err := cmd.DeleteNamespace()
+		if err != nil {
+			return f.advanceOnly(l, err, "delete_namespace 载荷非法，仅推进进度"), raftlog.OpDeleteNamespace
+		}
+		res, err := f.store.ApplyDeleteNamespace(context.Background(), data, l.Index, l.Term)
+		if err != nil {
+			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
+		}
+		if res.Status == raftlog.StatusOK {
+			// 逐条唤醒该 Namespace 下挂起的 Watch（Deleted 语义与单条删除一致）。
+			for _, e := range res.Deleted {
+				f.notify(data.Namespace, e.DataId, watch.Event{Version: e.Version, Deleted: true})
+			}
+		}
+		metrics.applyResults.WithLabelValues(string(res.Status)).Inc()
+		return res, raftlog.OpDeleteNamespace
+
 	default:
 		// 未知 op：推进进度，避免毒日志卡死重放。
 		return f.advanceOnly(l, fmt.Errorf("op %q 尚未实现", cmd.Op), "op 尚未实现，仅推进进度"), cmd.Op

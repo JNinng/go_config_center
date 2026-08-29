@@ -5,7 +5,7 @@
 ## Language
 
 **Namespace**:
-配置的名字空间，用于环境/团队隔离（如 dev、prod）。与 DataId 共同唯一标识一条配置。
+配置的名字空间，用于环境/团队隔离（如 dev、prod）。与 DataId 共同唯一标识一条配置。隐式创建（首次 Publish 生效）；可整体删除——删除其下全部存活条目并各写 Tombstone，History 保留可逐条回滚重建。
 _Avoid_: 环境、tenant、group
 
 **DataId**:

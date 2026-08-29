@@ -556,6 +556,59 @@ func (s *Store) ListNamespaces(ctx context.Context) ([]string, error) {
 	return namespaces, nil
 }
 
+// ApplyDeleteNamespace 在单个 PG 事务内完成 op=delete_namespace（DESIGN §5.1）：
+// 删除该 Namespace 下全部存活条目，各追加一条 content 为 NULL 的 Tombstone
+//（墓碑版本 = 删除前版本 + 1，版本序列照常延续）+ 推进 raft_fsm_meta。
+// 单条 CTE 原子完成：DELETE ... RETURNING 取回 (data_id, version)，随即逐行
+// INSERT Tombstone——结果携带被删条目清单与墓碑版本，供 FSM 唤醒 Watch。
+// 无存活条目为空操作（Entries=0，幂等）。
+func (s *Store) ApplyDeleteNamespace(ctx context.Context, d raftlog.DeleteNamespaceData, index, term uint64) (raftlog.Result, error) {
+	tctx, cancel := context.WithTimeout(ctx, applyTimeout)
+	defer cancel()
+
+	tx, err := s.pool.Begin(tctx)
+	if err != nil {
+		return raftlog.Result{}, fmt.Errorf("开启事务: %w", err)
+	}
+	committed := false
+	defer rollbackUnlessCommitted(tctx, tx, &committed)()
+
+	rows, err := tx.Query(tctx, `
+		WITH deleted AS (
+			DELETE FROM biz_configs WHERE namespace = $1
+			RETURNING data_id, version
+		)
+		INSERT INTO biz_config_history (namespace, data_id, version, op, actor)
+		SELECT $1, data_id, version + 1, 'delete', $2 FROM deleted
+		RETURNING data_id, version`, d.Namespace, d.Actor)
+	if err != nil {
+		return raftlog.Result{}, fmt.Errorf("删除 Namespace: %w", err)
+	}
+	defer rows.Close()
+
+	deleted := make([]raftlog.DeletedEntry, 0)
+	for rows.Next() {
+		var e raftlog.DeletedEntry
+		if err := rows.Scan(&e.DataId, &e.Version); err != nil {
+			return raftlog.Result{}, fmt.Errorf("读取删除结果: %w", err)
+		}
+		deleted = append(deleted, e)
+	}
+	if err := rows.Err(); err != nil {
+		return raftlog.Result{}, fmt.Errorf("遍历删除结果: %w", err)
+	}
+	rows.Close()
+
+	if err := advanceMeta(tctx, tx, index, term); err != nil {
+		return raftlog.Result{}, err
+	}
+	if err := tx.Commit(tctx); err != nil {
+		return raftlog.Result{}, fmt.Errorf("提交: %w", err)
+	}
+	committed = true
+	return raftlog.Result{Status: raftlog.StatusOK, Entries: int64(len(deleted)), Deleted: deleted}, nil
+}
+
 // AdvanceMeta 仅推进 raft_fsm_meta，用于信封损坏或 op 未实现但日志已提交的场景，
 // 保证 last_applied_index 无空洞。
 func (s *Store) AdvanceMeta(ctx context.Context, index, term uint64) error {

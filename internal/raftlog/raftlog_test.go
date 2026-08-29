@@ -103,3 +103,37 @@ func TestNewPublishValidation(t *testing.T) {
 		t.Errorf("合法最小 publish 不应报错: %v", err)
 	}
 }
+
+// delete_namespace op：编解码、空/超长 namespace 拒绝、Decode 白名单。
+func TestDeleteNamespaceRoundTrip(t *testing.T) {
+	cmd, err := NewDeleteNamespace(DeleteNamespaceData{Namespace: "dev", Actor: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Op != OpDeleteNamespace {
+		t.Fatalf("op = %q, want delete_namespace", cmd.Op)
+	}
+	b, err := Encode(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := decoded.DeleteNamespace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Namespace != "dev" || d.Actor != "admin" {
+		t.Fatalf("data = %+v", d)
+	}
+
+	if _, err := NewDeleteNamespace(DeleteNamespaceData{}); err == nil {
+		t.Fatal("空 namespace 应被拒绝")
+	}
+	long := strings.Repeat("a", MaxNamespaceLen+1)
+	if _, err := NewDeleteNamespace(DeleteNamespaceData{Namespace: long}); err == nil {
+		t.Fatal("超长 namespace 应被拒绝")
+	}
+}

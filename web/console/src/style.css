@@ -66,6 +66,60 @@ body {
   font-weight: 600;
 }
 
+.side-add {
+  float: right;
+  margin-right: 12px;
+  padding: 0 7px;
+  line-height: 18px;
+  border-radius: 4px;
+}
+
+.side-new {
+  display: flex;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+
+.side-new input {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  padding: 3px 6px;
+}
+
+.side-new button {
+  padding: 3px 10px;
+  font-size: 13px;
+}
+
+.ns-row {
+  display: flex;
+  align-items: center;
+}
+
+.ns-row a {
+  flex: 1;
+  min-width: 0;
+}
+
+.ns-del {
+  visibility: hidden;
+  margin-right: 8px;
+  padding: 0 7px;
+  line-height: 18px;
+  border-radius: 4px;
+  color: var(--muted);
+}
+
+.ns-row:hover .ns-del {
+  visibility: visible;
+}
+
+.ns-del:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
 .main {
   flex: 1;
   padding: 20px 28px;

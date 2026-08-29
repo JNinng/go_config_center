@@ -170,6 +170,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/watch", s.handleWatch)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs", s.handleListConfigs)
 	mux.HandleFunc("GET /v1/namespaces", s.handleListNamespaces)
+	mux.HandleFunc("DELETE /v1/namespaces/{ns}", s.handleDeleteNamespace)
 	mux.HandleFunc("DELETE /v1/namespaces/{ns}/configs/{data_id}", s.handleDelete)
 	mux.HandleFunc("POST /v1/namespaces/{ns}/configs/{data_id}/rollback", s.handleRollback)
 	mux.HandleFunc("POST /v1/cluster/join", s.handleJoin)
@@ -523,6 +524,43 @@ func (s *Server) handleListConfigs(w http.ResponseWriter, r *http.Request) {
 		resp["next_after_id"] = entries[len(entries)-1].DataId
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleDeleteNamespace 处理删除 Namespace（DESIGN §5.1）：经 Raft 提案原子删除该
+// Namespace 下全部存活 Config Entry（各写一条 Tombstone，History 保留可逐条回滚）。
+// 幂等：无存活条目返回 200 entries:0。
+func (s *Server) handleDeleteNamespace(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.writeGate(w, r) {
+		return
+	}
+	cmd, err := raftlog.NewDeleteNamespace(raftlog.DeleteNamespaceData{
+		Namespace: r.PathValue("ns"),
+		Actor:     "admin",
+	})
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+	b, err := raftlog.Encode(cmd)
+	if err != nil {
+		badRequest(w, err)
+		return
+	}
+
+	res, ok := s.propose(w, r, b)
+	if !ok {
+		return
+	}
+	switch res.Status {
+	case raftlog.StatusOK:
+		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "entries": res.Entries})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": res.Err})
+	}
 }
 
 // handleGet 读当前条目（本机 PG，允许陈旧；DESIGN §5.1）。

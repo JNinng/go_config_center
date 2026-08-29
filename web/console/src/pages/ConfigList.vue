@@ -141,7 +141,10 @@ async function create(): Promise<void> {
           <td class="hint">{{ fmtTime(e.updated_at) }}</td>
         </tr>
         <tr v-if="!entries.length && !loading">
-          <td colspan="5" class="hint">暂无存活条目（已删除条目不再列出，可在 History 中追溯）</td>
+          <td colspan="5" class="hint">
+            此 Namespace 暂无存活条目。全新 Namespace 请点击「新建配置」创建第一条
+            （Namespace 随首次 Publish 隐式创建）；已删除的条目可在 History 中追溯。
+          </td>
         </tr>
       </tbody>
     </table>

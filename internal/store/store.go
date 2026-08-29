@@ -55,6 +55,11 @@ type Store interface {
 	//（版本号照常消耗）+ 推进步度。条目不存在或 CAS 不匹配为拒绝结果。
 	ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, term uint64) (raftlog.Result, error)
 
+	// ApplyDeleteNamespace 应用 op=delete_namespace：单事务删除该 Namespace 下全部
+	// 存活条目，各追加一条 Tombstone（版本序列照常延续）+ 推进步度。
+	// 无存活条目时为空操作（Entries=0，幂等）；结果携带被删条目清单（供 Watch 唤醒）。
+	ApplyDeleteNamespace(ctx context.Context, d raftlog.DeleteNamespaceData, index, term uint64) (raftlog.Result, error)
+
 	// ApplyRollback 应用 op=rollback：以 to_version 从 History 取内容发布为新版本，
 	// 从不物理撤销；目标解析与发布同事务（无 TOCTOU）。
 	// 无效目标（History 不存在 / 指向 Tombstone / ≥ 当前版本）为拒绝结果。

@@ -14,9 +14,10 @@ const FormatVersion = 1
 type Op string
 
 const (
-	OpPublish  Op = "publish"
-	OpDelete   Op = "delete"
-	OpRollback Op = "rollback"
+	OpPublish         Op = "publish"
+	OpDelete          Op = "delete"
+	OpRollback        Op = "rollback"
+	OpDeleteNamespace Op = "delete_namespace"
 )
 
 // 与 PostgreSQL schema（DESIGN §3.1）和量级假设（DESIGN §1.3）一致的长度上限。
@@ -168,18 +169,55 @@ func (c Command) Rollback() (RollbackData, error) {
 	return d, nil
 }
 
-func validateIdentity(namespace, dataId string) error {
-	if namespace == "" {
-		return errors.New("namespace 不能为空")
+// DeleteNamespaceData 是 op=delete_namespace 的 data 载荷：原子删除该 Namespace
+// 下全部存活 Config Entry（各写一条 Tombstone，History 保留可逐条回滚，DESIGN §5.1）。
+type DeleteNamespaceData struct {
+	Namespace string `json:"namespace"`
+	Actor     string `json:"actor,omitempty"`
+}
+
+func NewDeleteNamespace(d DeleteNamespaceData) (Command, error) {
+	if err := validateNamespace(d.Namespace); err != nil {
+		return Command{}, err
 	}
-	if len(namespace) > MaxNamespaceLen {
-		return fmt.Errorf("namespace 长度超过 %d", MaxNamespaceLen)
+	data, err := json.Marshal(d)
+	if err != nil {
+		return Command{}, err
+	}
+	return Command{V: FormatVersion, Op: OpDeleteNamespace, Data: data}, nil
+}
+
+// DeleteNamespace 解码并校验 op=delete_namespace 的 data 载荷。
+func (c Command) DeleteNamespace() (DeleteNamespaceData, error) {
+	var d DeleteNamespaceData
+	if err := json.Unmarshal(c.Data, &d); err != nil {
+		return DeleteNamespaceData{}, fmt.Errorf("解析 delete_namespace data: %w", err)
+	}
+	if err := validateNamespace(d.Namespace); err != nil {
+		return DeleteNamespaceData{}, err
+	}
+	return d, nil
+}
+
+func validateIdentity(namespace, dataId string) error {
+	if err := validateNamespace(namespace); err != nil {
+		return err
 	}
 	if dataId == "" {
 		return errors.New("data_id 不能为空")
 	}
 	if len(dataId) > MaxDataIdLen {
 		return fmt.Errorf("data_id 长度超过 %d", MaxDataIdLen)
+	}
+	return nil
+}
+
+func validateNamespace(namespace string) error {
+	if namespace == "" {
+		return errors.New("namespace 不能为空")
+	}
+	if len(namespace) > MaxNamespaceLen {
+		return fmt.Errorf("namespace 长度超过 %d", MaxNamespaceLen)
 	}
 	return nil
 }
@@ -197,7 +235,7 @@ func Decode(b []byte) (Command, error) {
 		return Command{}, fmt.Errorf("不支持的日志格式版本 v=%d", c.V)
 	}
 	switch c.Op {
-	case OpPublish, OpDelete, OpRollback:
+	case OpPublish, OpDelete, OpRollback, OpDeleteNamespace:
 	default:
 		return Command{}, fmt.Errorf("未知 op %q", c.Op)
 	}
@@ -219,14 +257,23 @@ const (
 	StatusError           Status = "error"            // 内部错误
 )
 
+// DeletedEntry 是 op=delete_namespace 被删条目的一条记录（data_id 与墓碑版本），
+// 供 FSM 逐条唤醒 Watch；其他 op 恒为 nil。
+type DeletedEntry struct {
+	DataId  string
+	Version int64
+}
+
 // Result 由 FSM.Apply 返回，经 ApplyFuture 回传给 API 层映射为 200/409/404。
 type Result struct {
 	Status         Status
-	Version        int64  // ok 时新分配的 Version
-	CurrentVersion int64  // version_conflict 时条目当前 Version
-	Created        bool   // ok 时是否为新建（此前无存活条目）
-	Err            string // 非 ok 时的补充说明
-	Index          uint64 // replayed 时命中的日志 index，供上层定位 lineage 错位
+	Version        int64         // ok 时新分配的 Version
+	CurrentVersion int64         // version_conflict 时条目当前 Version
+	Created        bool          // ok 时是否为新建（此前无存活条目）
+	Entries        int64         // ok 且 op=delete_namespace 时删除的条目数
+	Deleted        []DeletedEntry // ok 且 op=delete_namespace 时的被删条目清单
+	Err            string        // 非 ok 时的补充说明
+	Index          uint64        // replayed 时命中的日志 index，供上层定位 lineage 错位
 }
 
 func OK(version int64, created bool) Result {

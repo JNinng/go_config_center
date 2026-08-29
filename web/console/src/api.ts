@@ -111,6 +111,10 @@ export function listNamespaces(): Promise<{ namespaces: string[] }> {
   return api('GET', '/v1/namespaces')
 }
 
+export function deleteNamespace(ns: string): Promise<{ status: string; entries: number }> {
+  return api('DELETE', `/v1/namespaces/${encodeURIComponent(ns)}`)
+}
+
 export function listConfigs(
   ns: string,
   limit?: number,

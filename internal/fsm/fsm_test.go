@@ -392,3 +392,95 @@ func TestApplyResultsMetricsLabels(t *testing.T) {
 		}
 	}
 }
+
+func deleteNamespaceLog(t *testing.T, index, term uint64, ns string) *raft.Log {
+	t.Helper()
+	cmd, err := raftlog.NewDeleteNamespace(raftlog.DeleteNamespaceData{Namespace: ns, Actor: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := raftlog.Encode(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
+}
+
+// 验收：delete_namespace 单日志原子删除全部条目（各写 Tombstone）、结果携带
+// 被删条目与墓碑版本、进度推进；删除后逐条回滚可重建。
+func TestApplyDeleteNamespaceRemovesAllAndAdvances(t *testing.T) {
+	f, st, dsn := mustFSM(t)
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+	apply(t, f, publishLog(t, 2, 1, t.Name(), "a", "v2", nil))
+	apply(t, f, publishLog(t, 3, 1, t.Name(), "b", "x", nil))
+
+	res := apply(t, f, deleteNamespaceLog(t, 4, 1, t.Name()))
+	if res.Status != raftlog.StatusOK || res.Entries != 2 {
+		t.Fatalf("result = %+v, want ok entries=2", res)
+	}
+	byID := map[string]int64{}
+	for _, e := range res.Deleted {
+		byID[e.DataId] = e.Version
+	}
+	if byID["a"] != 3 || byID["b"] != 2 {
+		t.Fatalf("墓碑版本 = %v, want a=3 b=2", byID)
+	}
+	if entry, _ := st.GetEntry(context.Background(), t.Name(), "a"); entry != nil {
+		t.Fatalf("删除后 GetEntry(a) = %+v, want nil", entry)
+	}
+	if n := testutil.QueryInt(t, dsn,
+		`SELECT count(*) FROM biz_config_history WHERE namespace=$1 AND op='delete' AND content IS NULL`, t.Name()); n != 2 {
+		t.Fatalf("Tombstone 行数 = %d, want 2", n)
+	}
+	if idx, _, _ := st.LoadMeta(context.Background()); idx != 4 {
+		t.Fatalf("meta index = %d, want 4", idx)
+	}
+
+	// 删除后回滚重建：a 回滚到墓碑之前的 v1。
+	res = apply(t, f, rollbackLog(t, 5, 1, t.Name(), "a", 1))
+	if res.Status != raftlog.StatusOK || res.Version != 4 || !res.Created {
+		t.Fatalf("回滚重建 = %+v, want ok v4 created", res)
+	}
+	entry, _ := st.GetEntry(context.Background(), t.Name(), "a")
+	if entry == nil || entry.Content != "v1" || entry.Version != 4 {
+		t.Fatalf("重建条目 = %+v, want v1 @ v4", entry)
+	}
+}
+
+// 验收：delete_namespace 逐条唤醒该 Namespace 下挂起的 Watch（Deleted 语义与单条删除一致）。
+func TestApplyDeleteNamespaceNotifiesEachWatch(t *testing.T) {
+	dsn := testutil.NewDB(t, "gcc_fsm_test")
+	st, err := pg.Open(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	hub := watch.NewHub()
+	f, err := New(context.Background(), st, hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
+	apply(t, f, publishLog(t, 2, 1, t.Name(), "b", "x", nil))
+	releaseA, eventsA := hub.Register(t.Name(), "a")
+	defer releaseA()
+	releaseB, eventsB := hub.Register(t.Name(), "b")
+	defer releaseB()
+
+	apply(t, f, deleteNamespaceLog(t, 3, 1, t.Name()))
+
+	for name, ch := range map[string]<-chan watch.Event{"a": eventsA, "b": eventsB} {
+		select {
+		case ev := <-ch:
+			if !ev.Deleted {
+				t.Fatalf("%s 事件 = %+v, want deleted", name, ev)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s 挂起 Watch 未在 delete_namespace 后唤醒", name)
+		}
+	}
+}

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
-import { getToken, setToken, unauthorized, listNamespaces } from './api'
+import { getToken, setToken, unauthorized, deleteNamespace, listNamespaces } from './api'
 import { route } from './router'
 import ConfigList from './pages/ConfigList.vue'
 import ConfigDetail from './pages/ConfigDetail.vue'
@@ -9,6 +9,8 @@ import Cluster from './pages/Cluster.vue'
 const namespaces = ref<string[]>([])
 const nsError = ref('')
 const tokenInput = ref('')
+const showNewNs = ref(false)
+const newNs = ref('')
 
 async function refreshNamespaces(): Promise<void> {
   nsError.value = ''
@@ -22,6 +24,48 @@ async function refreshNamespaces(): Promise<void> {
 onMounted(refreshNamespaces)
 // 从详情页返回等场景下 namespace 清单可能已变化，简单起见每次路由切换后静默刷新。
 watch(route, refreshNamespaces)
+
+// 新增 Namespace：Namespace 为隐式创建（首次 Publish 生效，DESIGN §5.1），
+// 此处仅校验命名并跳转到新列表页，由"新建配置"创建第一条。
+function createNs(): void {
+  const ns = newNs.value.trim()
+  if (!ns) return
+  if (ns.length > 64) {
+    nsError.value = 'Namespace 长度不能超过 64'
+    return
+  }
+  if (/[/\\\s]/.test(ns)) {
+    nsError.value = 'Namespace 不能包含空白、/ 或 \\'
+    return
+  }
+  newNs.value = ''
+  showNewNs.value = false
+  location.hash = `#/ns/${encodeURIComponent(ns)}`
+}
+
+// 删除 Namespace：原子删除其下全部存活条目（各写 Tombstone，可逐条回滚）。
+// 输入 Namespace 名二次确认，防止误删。
+async function removeNs(ns: string): Promise<void> {
+  const typed = prompt(
+    `删除 Namespace「${ns}」将删除其下全部配置（各写 Tombstone，History 保留可逐条回滚）。\n输入 Namespace 名确认：`,
+    '',
+  )
+  if (typed === null) return
+  if (typed.trim() !== ns) {
+    nsError.value = '输入不一致，已取消'
+    return
+  }
+  try {
+    const res = await deleteNamespace(ns)
+    if ((route.value.name === 'list' || route.value.name === 'detail') && route.value.ns === ns) {
+      location.hash = '#/'
+    }
+    await refreshNamespaces()
+    nsError.value = `已删除「${ns}」（${res.entries} 条，可回滚）`
+  } catch (e) {
+    nsError.value = (e as Error).message
+  }
+}
 
 function saveToken(): void {
   if (tokenInput.value.trim()) {
@@ -39,14 +83,18 @@ const isListActive = (ns: string): boolean =>
 <template>
   <nav class="sidebar">
     <h1>配置中心控制台</h1>
-    <div class="side-label">Namespace</div>
-    <a
-      v-for="ns in namespaces"
-      :key="ns"
-      :href="`#/ns/${encodeURIComponent(ns)}`"
-      :class="{ active: isListActive(ns) }"
-      >{{ ns }}</a
-    >
+    <div class="side-label">
+      Namespace
+      <button class="side-add" title="新建 Namespace" @click="showNewNs = !showNewNs">＋</button>
+    </div>
+    <div v-if="showNewNs" class="side-new">
+      <input v-model="newNs" placeholder="新 Namespace 名" @keyup.enter="createNs" />
+      <button class="primary" @click="createNs">创建</button>
+    </div>
+    <div v-for="ns in namespaces" :key="ns" class="ns-row">
+      <a :href="`#/ns/${encodeURIComponent(ns)}`" :class="{ active: isListActive(ns) }">{{ ns }}</a>
+      <button class="ns-del" title="删除 Namespace" @click="removeNs(ns)">×</button>
+    </div>
     <div v-if="nsError" class="error" style="margin: 8px 16px">{{ nsError }}</div>
     <div class="side-label">集群</div>
     <a href="#/cluster" :class="{ active: route.name === 'cluster' }">实例与状态</a>

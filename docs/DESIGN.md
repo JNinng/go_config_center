@@ -102,9 +102,10 @@ CREATE TABLE raft_fsm_meta (
 {"v": 1, "op": "publish",  "data": {"namespace": "...", "data_id": "...", "data_type": "JSON", "content": "...", "tags": {}, "expected_version": 3, "actor": "user-a"}}
 {"v": 1, "op": "delete",   "data": {"namespace": "...", "data_id": "...", "expected_version": null, "actor": "user-a"}}
 {"v": 1, "op": "rollback", "data": {"namespace": "...", "data_id": "...", "to_version": 3, "actor": "user-a"}}
+{"v": 1, "op": "delete_namespace", "data": {"namespace": "...", "actor": "user-a"}}
 ```
 
-`v` 为日志格式版本，升级编解码时递增并兼容读取。多操作批量 Publish 是后续扩展（`op: "batch"`），不改变单操作语义。
+`v` 为日志格式版本，升级编解码时递增并兼容读取。`op=delete_namespace` 原子删除该 Namespace 下全部存活条目并各写 Tombstone（History 保留可逐条回滚，见 §5.1）；旧版本节点解码不到该 op 时按 §3.3 的 advanceOnly 推进进度不崩溃。多操作批量 Publish 是后续扩展（`op: "batch"`），不改变单操作语义。
 
 ### 3.3 FSM 不变量
 
@@ -201,9 +202,10 @@ Raft 没有"通知节点已被移除"的机制。成员表（hashicorp/raft 称 
 | `POST /v1/namespaces/{ns}/configs/{data_id}/rollback` | body `{to_version}`。200 `{version}`；404 条目从未存在；409 目标无效 |
 | `GET /v1/namespaces/{ns}/configs/{data_id}/watch?v=N&timeout=30s` | 见 4.3 |
 | `GET /v1/namespaces` | 仍有存活条目的 Namespace 去重清单（字典序） |
+| `DELETE /v1/namespaces/{ns}` | 原子删除该 Namespace 下全部存活 Config Entry，各写一条 Tombstone（墓碑版本 = 删前版本 + 1，版本序列延续）；History 保留，可对任一条目回滚重建。200 `{status:"deleted", entries:N}`；无存活条目幂等 200 `entries:0` |
 | `GET /v1/namespaces/{ns}/configs?limit=100&after_id=` | 条目列表：仅存活条目，data_id 字典序 keyset 分页；响应 `{entries: [<元数据，不含 content>], next_after_id?}`，本页不满 limit 时省略 `next_after_id`（已到末尾） |
 
-Namespace 隐式创建（首次 Publish 即生效），无独立管理接口。
+Namespace 隐式创建（首次 Publish 即生效），无独立创建接口——"新增 Namespace"由控制台引导向新 Namespace 发布首条配置完成。
 
 ### 5.2 集群管理（Leader 处理，否则 307/503）
 
@@ -234,6 +236,7 @@ Namespace 隐式创建（首次 Publish 即生效），无独立管理接口。
 - 挂载于根路径：`GET /` 为 ServeMux 通配兜底，精确注册的 API 路径按特异性优先不受遮蔽；dist 内不存在的路径回退 index.html（SPA fallback）。挂载后未注册路径的 POST 由 404 变为 405（命中 `GET /` 模式但方法不符，ServeMux 语义）。
 - 控制台静态资源不鉴权（与读接口同属内网信任模型）；写操作由使用者在页面内提供 admin_token，经 `Authorization` 头携带，存于浏览器 localStorage。
 - 页面发布/删除均自动携带 Expected Version（CAS），冲突时展示当前版本并要求刷新。
+- Namespace 管理：侧栏可新建（引导向新 Namespace 发布首条，隐式创建）与删除（调 `DELETE /v1/namespaces/{ns}`，输入 Namespace 名二次确认；删除后当前页是该 Namespace 时跳回首页）。
 
 ## 6. 配置与部署
 
