@@ -27,7 +27,6 @@ go.work.sum
 
 .idea
 .zcode
-.scratch
 
 # 本地开发产物
 data/
