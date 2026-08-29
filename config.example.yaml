@@ -24,3 +24,4 @@ raft:
   snapshot_threshold: 10000   # 已应用日志达到该条数触发快照
   snapshot_retention: 2       # 本地保留快照个数
   trailing_logs: 10240        # 快照点之后保留的日志条数
+  snapshot_interval: 120s     # 周期性触发快照的间隔

@@ -5,7 +5,7 @@
 ## Considered Options
 
 - **三节点共用一个 PG**：被否决——此时 Raft 多数派复制是多余的，PG 自身就是单点真相源，整个共识层没有存在意义。
-- **嵌入式 KV（BoltBBolt/Pebble 等）**被否决——放弃 SQL 查询、备份与既有 PG 运维生态。
+- **嵌入式 KV（BoltDB/Pebble 等）**被否决——放弃 SQL 查询、备份与既有 PG 运维生态。
 
 ## Consequences
 

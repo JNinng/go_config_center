@@ -44,9 +44,17 @@ _Avoid_: 订阅、listener、push
 集群成员的持久唯一标识（UUID），生命周期内不随地址变化。
 _Avoid_: server、peer、IP
 
+**成员表**:
+Raft 集群的成员清单（各成员的 Node ID、地址、投票权），以日志条目复制并提交，是集群成员的唯一真相源。hashicorp/raft 称 Configuration，与业务的 Config Entry 无关。
+_Avoid_: 成员配置、集群配置、peers
+
 **Seed List**:
 新节点启动时用于寻找 Leader 的候选地址列表，仅服务发现，不是集群成员的真相源。
 _Avoid_: peers、成员表
+
+**发现代理**:
+节点内寻找 Leader 的后台任务：启动时扫描 Seed List 并执行 Join；加入成功后周期刷新 Leader 的 HTTP 地址（供 307 重定向与被移除自退出核对）。
+_Avoid_: 服务发现、registry、proxy
 
 **Bootstrap**:
 将空数据目录的节点初始化为单节点新集群的一次性操作，仅允许在一个节点上执行。

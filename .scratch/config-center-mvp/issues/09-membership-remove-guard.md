@@ -16,9 +16,13 @@
 护栏实现：Leader 移除前计算移除后 voter 数与 quorum，剩余 voter 以 HTTP 探活
 （/internal/discovery，地址取 Join 时登记表；地址未知按离线处理——护栏失效方向为拒绝），
 本 Leader 计入在线；online < quorum → 409 quorum_guard。status 端点票 08 已交付。
-设计勘误（实现要点）：hashicorp/raft 的 ShutdownOnRemove 仅在节点收到不含自身的新配置时
-触发——Leader 不变更时被移除节点收不到任何 raft 消息，永远不会自行退出。补齐主动核对：
-各节点周期向 Leader 的 cluster/status 核对自身是否在成员表，缺席即退出 42；查询失败
-不退出（保守方向）。e2e 实测：三节点在线移除 → 200 + 被移除节点 ~2s 内以 42 退出 +
+设计勘误（实现要点）：Raft 没有"通知节点已被移除"的机制。成员表以日志形式复制：每次成员
+变更，Leader 追加一条日志，内容是变更后的完整成员表，并立即停止向被移除节点复制。
+hashicorp/raft 的 ShutdownOnRemove（默认开启）仅在本节点作为 Leader、且提交的成员表已
+不含自身时关闭 Raft——只覆盖移除 Leader 自身的场景；被移除的 Follower 收不到任何 raft
+消息（应用不含自身的成员表时库不做自检），且 v1.7.3 在处理 term 之前就拒绝非成员的
+投票请求，库内路径对它永不生效。故由本服务补齐主动核对：非 Leader 节点周期（2s）向
+Leader 的 cluster/status 核对自身是否在成员表，缺席即退出 42；查询失败不退出（保守
+方向）。完整机制见 DESIGN §4.5。e2e 实测：三节点在线移除 → 200 + 被移除节点 ~2s 内以 42 退出 +
 二节点集群读写正常；清空 data_dir 重新 Join 回 3 voter（DESIGN §4.5 换 IP 流程）；
 宕机一节点后移除在线节点 → 409 且集群写入不受影响；重复 Join 幂等 200 exists。

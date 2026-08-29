@@ -654,8 +654,8 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleJoin 处理成员加入（DESIGN §4.5/§5.2）：Leader 执行 AddVoter（staging 进入，
-// 复制追平后自动转正）。接口幂等：已是成员（地址相同）返回 200。
+// handleJoin 处理成员加入（DESIGN §4.5/§5.2）：Leader 执行 AddVoter，加入即 voter
+//（staging 自动转正在 hashicorp/raft 中未实现）。接口幂等：已是成员（地址相同）返回 200。
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})

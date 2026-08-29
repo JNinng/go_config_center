@@ -30,7 +30,7 @@ type Options struct {
 	HTTPAdvertise string
 	Seeds         []string // 对端节点的 HTTP 基地址（如 http://127.0.0.1:8080）
 	AdminToken    string
-	// RefreshPeriod 是加入成功后跟踪 Leader 地址的刷新周期，缺省 15s（测试可缩短）。
+	// RefreshPeriod 是加入成功后跟踪 Leader 地址的刷新周期，缺省 5s（测试可缩短）。
 	RefreshPeriod time.Duration
 	// OnLeader 在本节点获知 Leader 地址时被调用（含加入成功后与刷新期间）。
 	// raftAddr 供调用方校验缓存新鲜度（Leader 更换后旧 HTTP 地址立即失效）。

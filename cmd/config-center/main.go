@@ -121,7 +121,8 @@ func main() {
 		}
 	}
 	// 非 bootstrap 节点不再因无集群态而退出：由发现代理经 Seed List 加入（ADR-0008，
-	// 永不自举）；已有状态的节点由 Raft 成员表自愈，发现代理仅跟踪 Leader 地址。
+	// 永不自举）；已有状态的节点重启后仍是成员（成员表随 Raft 日志持久化），
+	// 发现代理跳过 Join、仅跟踪 Leader 地址。
 
 	r, err := raft.NewRaft(raftCfg, machine, boltStore, boltStore, snapStore, transport)
 	if err != nil {
@@ -237,8 +238,9 @@ func main() {
 		return out, nil
 	}
 	// joinFn 在 Leader 上执行成员加入。同 Node ID 换地址时按新地址覆盖（幂等语义）。
-	// 注：直接以 voter 加入——上游库的 staging 自动转正从未实现（membership.md 仅提案），
-	// AddVoter 缺省即 Voter，与 Consul 等生产用法一致（DESIGN §4.5 注记）。
+	// 注：加入即 voter——hashicorp/raft 只在提案文档 membership.md 里设计过 staging
+	//（先以非投票身份加入、追平后自动转 voter），从未实现；AddVoter 直接赋予投票权，
+	// 与 Consul 等生产用法一致（DESIGN §4.5 注记）。
 	var peerHTTP sync.Map // ServerID → HTTP 基地址（Join 时登记，供移除护栏探活）
 	joinFn := func(peerID, peerRaftAddr, peerHTTPAddr string) (bool, error) {
 		f := r.GetConfiguration()
@@ -399,10 +401,13 @@ func main() {
 		Remove:      removeFn,
 	}).Routes()
 
-	// 被移除节点自退出（DESIGN §4.5）：以专用退出码 EXIT_REMOVED = 42 终止进程。
-	// 两条触发路径：① 库在收到不含自身的新配置时自动 Shutdown（ShutdownOnRemove，
-	// 通常发生在换主后）；② Leader 未变更时被移除节点收不到任何 raft 消息——
-	// 主动向 Leader 的 cluster/status 核对成员表，缺席即退出。查询失败不退出（保守）。
+	// 被移除节点自退出（DESIGN §4.5）：下方循环每 2s 检查一次，命中任一条件即以专用
+	// 退出码 EXIT_REMOVED = 42 终止进程——① Raft 已关闭：ShutdownOnRemove（库默认开启）
+	// 仅在本节点作为 Leader、提交的成员表已不含自身时触发库内关闭，即移除 Leader
+	// 自身的场景；移除 Follower 时库不会关闭它（收不到任何 Raft 消息，投票请求也会被
+	// 成员节点拒绝）；② 非 Leader 节点向发现代理缓存的 Leader 地址查 cluster/status，
+	// 成员表不含自身即退出。查询失败不退出（宁可多留进程，不误杀节点）；gracefulExit
+	// 置位（人工优雅停机）后两条路径均不再生效。
 	var gracefulExit atomic.Bool
 	go func() {
 		client := &http.Client{Timeout: 1500 * time.Millisecond}

@@ -20,7 +20,7 @@
 - 多租户与细粒度权限（仅有单一 Admin Token）
 - 灰度发布、配置对比合并
 - 客户端 SDK、gRPC
-- 引用式/分片快照（S3 等）。`SnapshotStore` 是替换边界，数据量达千万级时另行实现（ADR-0007）
+- 引用式/分片快照（数据存 S3 等外部存储，快照文件仅存引用）。`SnapshotStore` 是预留的替换点，数据量达千万级时另行实现（ADR-0007）
 
 ### 1.3 量级假设
 
@@ -35,12 +35,12 @@
 | API 层 | net/http，配置与集群 API、307 重定向、Watch 长轮询 |
 | Raft Core | hashicorp/raft + raft-boltdb（日志）+ FileSnapshotStore（快照落盘）+ 内置 TCP 传输 |
 | PostgresFSM | 将已提交日志事务性写入本机 PG；快照导出/导入 |
-| 发现代理 | 启动时扫描 Seed List 寻找 Leader，执行 Join |
+| 发现代理 | 启动时扫描 Seed List 寻找 Leader 并 Join；加入后周期刷新 Leader 的 HTTP 地址（供 307 重定向） |
 
 数据流向：
 
 - **写**：Client → Leader → Raft 日志 → 多数派提交 → 各节点 FSM Apply → 各自 PG。已提交的写在 Leader 任期内保证不丢。
-- **读**：Client → 任意节点 → 本机 PG。Follower 读允许落后 Leader 数条已提交日志（正常毫秒级）；读己之写靠 Publish 返回的 Version 与 Watch 协商完成（ADR-0003）。
+- **读**：Client → 任意节点 → 本机 PG。Follower 读允许落后 Leader 数条已提交日志（正常毫秒级）；客户端要读到自己的写（read-your-writes），以 Publish 返回的 Version 为基准，用 Watch 的 `v` 参数或 GET 结果比对版本即可（ADR-0003）。
 - **Watch**：Client 挂在任意节点；FSM Apply 到 Publish/删除时唤醒本机挂起的 Watch。
 - **快照**：Leader/Follower 各自本地生成；落后节点通过标准 InstallSnapshot 接收。
 
@@ -92,7 +92,7 @@ CREATE TABLE raft_fsm_meta (
 - `biz_configs.version` 恒等于该条目 History 中的最大 version。
 - 版本号按 `(namespace, data_id)` 单调分配，Publish 与 Delete 均消耗版本号；删除后重建延续同一序列。
 - History 只追加，永不 UPDATE/DELETE。
-- `raft_fsm_meta` 与业务表同事务更新，二者进度恒一致——这是跳过式恢复的依据。
+- `raft_fsm_meta` 与业务表同事务更新，二者进度恒一致——这是 §4.4 跳过式恢复（本机进度不落后于快照点时跳过数据导入）的依据。
 
 ### 3.2 Raft 日志格式
 
@@ -142,7 +142,7 @@ Expected Version（CAS）规则，`expected_version` 省略时为 LWW（最后�
 
 - 挂起至该条目 version > N、条目被删除、或超时。
 - 响应：变更 → 200 `{status: "active", entry: {...}}` 或 `{status: "deleted", version: V}`；超时 → 200 `{status: "timeout", version: N}`，客户端原样重挂。
-- 挂起实现在任意节点（Follower 同样 Apply 日志并本地唤醒）；节点落后或分区只表现为超时，由客户端重试兜底。
+- 挂起可在任意节点受理（Follower 同样 Apply 日志并在本地唤醒）；节点落后或分区只表现为超时，由客户端重试兜底。
 
 ### 4.4 快照与恢复（ADR-0007）
 
@@ -171,9 +171,18 @@ Serving 门闩为进程内原子布尔；false 期间所有读 API 返回 **503 
 
 **Bootstrap**（ADR-0008）：全新集群仅在首节点执行一次 `--bootstrap`（单 voter 集群）；本地已有集群态时该命令必须报错退出。其余节点永久禁止自举——不存在"探测失败则自举"的路径。
 
-**Join**：新节点/重连节点启动后扫描 Seed List（排除自身地址），逐个调 `GET /internal/discovery`：对方为 Leader → 向其 `POST /v1/cluster/join`；对方为 Follower → 从响应取 Leader 地址再试。全部不可达 → 指数退避重试，永不自举、不退出。Leader 收到 Join 后 `AddVoter`，接口幂等（已是成员 → 200）。注：直接以 voter 身份加入——hashicorp/raft 的 staging 自动转正从未实现（membership.md 仅提案未落地），显式 voter 加入与 Consul 等生产用法一致。
+**Join**：新节点/重连节点启动后扫描 Seed List（排除自身地址），逐个调 `GET /internal/discovery`：对方为 Leader → 向其 `POST /v1/cluster/join`；对方为 Follower → 从响应取 Leader 地址再试。全部不可达 → 指数退避重试，永不自举、不退出。Leader 收到 Join 后 `AddVoter`，接口幂等（已是成员 → 200）。注：加入即 voter。hashicorp/raft 的设计文档（membership.md）提出过 staging——先以非投票身份加入、复制追平后自动转为 voter——但库从未实现，`AddVoter` 直接赋予投票权；Consul 等生产用法相同。
 
-**Remove**：`DELETE /v1/cluster/peers/{node_id}`，执行前护栏校验——**移除后所需 quorum 必须不大于剩余在线 voter 数**，不满足返回 409（Raft 库不提供此保护）。被移除节点以专用退出码（`EXIT_REMOVED = 42`）退出进程，双路径触发：① 库收到不含自身的新配置时自动 Shutdown（`ShutdownOnRemove`，通常发生在换主后）；② Leader 未变更时被移除节点收不到任何 raft 消息——各节点周期（2s）向 Leader 的 `cluster/status` 主动核对成员表，自身缺席即退出；核对失败不退出（保守方向）。部署单元将该退出码配置为不自动重启。
+**Remove**：`DELETE /v1/cluster/peers/{node_id}`，执行前护栏校验——**移除后所需 quorum 不得超过剩余在线 voter 数**（在线以对该节点 HTTP 探活判定，执行方 Leader 自身视为在线），不满足返回 409（Raft 库不提供此保护）。
+
+Raft 没有"通知节点已被移除"的机制。成员表（hashicorp/raft 称 Configuration，与业务的 Config Entry 无关）以日志形式复制：每次成员变更，Leader 追加一条日志，内容是变更后的完整成员表，并立即停止向被移除节点复制（心跳随之停止）——此后它收不到任何 Raft 消息。`ShutdownOnRemove`（库默认开启）只覆盖一种情形——**本节点作为 Leader，提交的成员表已不含自身**——此时自动关闭 Raft，即移除 Leader 自身的场景（该条日志提交后立即触发，集群随后重新选举）。移除 Follower 时该机制不会生效：Follower 应用不含自身的成员表时，库不做任何自检；而 v1.7.3 对不在成员表中的节点发来的投票请求直接拒绝（在处理 term 之前），它无法借重新当选走到上述关闭点。
+
+因此被移除节点的退出由本服务自己保证：自退出循环每 2s 检查一次，命中任一条件即以专用退出码 `EXIT_REMOVED = 42` 终止进程——
+
+1. Raft 已关闭（状态 Shutdown，含上述库内自关闭）；
+2. 非 Leader 节点向发现代理缓存的 Leader 地址查 `GET /v1/cluster/status`，响应成员表已不含自身 Node ID。
+
+条件 2 查询失败（无 Leader、网络分区、地址未知）不视为被移除，不退出——宁可多留一个进程，不误杀在线节点；人工优雅停机不触发退出。部署单元应将退出码 42 配置为不自动重启。
 
 **换 IP**：运维流程 = Leader 上移除旧成员（护栏校验）→ 节点清空 `data_dir`、以新 Node ID 重新 Join（快照 + 日志追平，分钟级）。
 
@@ -199,14 +208,14 @@ Namespace 隐式创建（首次 Publish 即生效），无独立管理接口。
 
 | 方法与路径 | 语义 |
 |---|---|
-| `GET /v1/cluster/status` | 本节点视角：`{node_id, role, term, leader_id, leader_addr, last_applied_index, restoring, members: [{node_id, addr, role, suffrage}]}`。任意节点可调 |
-| `POST /v1/cluster/join` | body `{node_id, raft_addr}`。202 已受理；幂等 200 |
-| `POST /v1/cluster/snapshot` | 手动触发 FSM 快照（§4.4"达到阈值或手动触发"）。200 `{status:"ok", snapshot_index}`；空 FSM 再触发 200 `{status:"noop"}` |
+| `GET /v1/cluster/status` | 本节点视角：`{node_id, role, term, leader_id, leader_addr, leader_http_addr, last_applied_index, restoring, members: [{node_id, addr, role, suffrage}]}`。任意节点可调 |
+| `POST /v1/cluster/join` | body `{node_id, raft_addr, http_addr?}`（http_addr 登记后供移除护栏探活）。202 已受理；幂等 200 |
+| `POST /v1/cluster/snapshot` | 手动触发 FSM 快照（§4.4"达到阈值或手动触发"）。200 `{status:"ok", snapshot_index}`；快照点之后无新日志时再触发 200 `{status:"noop"}` |
 | `DELETE /v1/cluster/peers/{node_id}` | 移除成员。200；409 护栏拒绝；404 非成员 |
 
-### 5.3 内部接口（仅供发现代理，不认证）
+### 5.3 内部接口（不认证）
 
-`GET /internal/discovery` → `{node_id, role, leader_addr}`（role ∈ leader/follower/candidate）。
+`GET /internal/discovery` → `{node_id, role, leader_addr, leader_http_addr}`（role ∈ leader/follower/candidate）。调用方：发现代理（寻找 Leader）与移除护栏（探活）。
 
 ### 5.4 运维端点
 
@@ -224,6 +233,9 @@ Namespace 隐式创建（首次 Publish 即生效），无独立管理接口。
 # 留空则首次启动生成 UUID 并持久化到 <data_dir>/node-id
 node_id: ""
 http_addr: ":8080"
+# 对外通告的 HTTP 基地址（307 重定向与 Join 响应携带）；
+# 留空按 raft_addr 的主机 + http_addr 的端口推导，跨机部署时须显式配置
+http_advertise: "http://192.168.1.10:8080"
 # Raft 对外通告地址（成员间复制流量）
 raft_addr: "192.168.1.10:7946"
 data_dir: "./data"
@@ -243,6 +255,7 @@ raft:
   snapshot_threshold: 10000   # 已应用日志达到该条数触发快照
   snapshot_retention: 2       # 本地保留快照个数
   trailing_logs: 10240        # 快照点之后保留的日志条数
+  snapshot_interval: 120s     # 周期性触发快照的间隔
 ```
 
 选举/心跳超时采用库默认值；若故障转移实测不达标再调。
@@ -291,7 +304,7 @@ config-center --config config.yaml
    - 写压测中杀 Leader：秒级完成选举，已提交写不丢，307/503 按语义返回；
    - Follower 分区 30s 后恢复：无人工干预追平；
    - 带数据节点重启：断言 ≤10s 就绪（跳过式恢复生效）；
-   - 新节点 Join：从快照 + 日志追平并转正；
+   - 新节点 Join：经快照与日志追平数据（加入即 voter，无转正阶段）；
    - 移除节点：护栏 409 路径与正常路径均验证；被移除节点以 42 退出；
    - 落后 Follower 触发 InstallSnapshot：Restore 后读数据一致。
 3. **启动时间断言**（自动化防回归）：空库 ≤3s；10 万条（含 History）冷启 ≤10s。
