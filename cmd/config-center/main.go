@@ -25,6 +25,7 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 	"github.com/jninng/go_config_center/internal/api"
 	"github.com/jninng/go_config_center/internal/config"
+	"github.com/jninng/go_config_center/internal/console"
 	"github.com/jninng/go_config_center/internal/discovery"
 	"github.com/jninng/go_config_center/internal/fsm"
 	"github.com/jninng/go_config_center/internal/nodeid"
@@ -388,6 +389,11 @@ func main() {
 		_ = rc.Close()
 		return meta.Index, nil
 	}
+	// 控制台静态资源（ADR-0012）：构建产物内嵌，未构建时为占位页。
+	consoleHandler, err := console.Handler()
+	if err != nil {
+		fatal(logger, "装配控制台", err)
+	}
 	mux := api.New(api.Deps{
 		Proposer:    proposer,
 		Store:       st,
@@ -399,6 +405,7 @@ func main() {
 		Members:     members,
 		Join:        joinFn,
 		Remove:      removeFn,
+		Console:     consoleHandler,
 	}).Routes()
 
 	// 被移除节点自退出（DESIGN §4.5）：下方循环每 2s 检查一次，命中任一条件即以专用

@@ -81,6 +81,9 @@ type Deps struct {
 	Members     func() ([]MemberInfo, error)
 	Join        JoinFunc
 	Remove      RemoveFunc
+	// Console 是控制台的静态资源 handler（ADR-0012），注册为 GET / 通配兜底；
+	// nil 时不挂载（未匹配路径交由 ServeMux 默认 404）。
+	Console http.Handler
 }
 
 // Watch 挂起时长边界（DESIGN §4.3：默认 30s，客户端原样重挂）。
@@ -100,6 +103,7 @@ type Server struct {
 	members    func() ([]MemberInfo, error)
 	join       JoinFunc
 	remove     RemoveFunc
+	console    http.Handler
 }
 
 func New(d Deps) *Server {
@@ -107,6 +111,7 @@ func New(d Deps) *Server {
 		proposer: d.Proposer, store: d.Store, hub: d.Hub,
 		adminToken: d.AdminToken, ready: d.Ready, snapshot: d.Snapshot,
 		cluster: d.ClusterInfo, members: d.Members, join: d.Join, remove: d.Remove,
+		console: d.Console,
 	}
 }
 
@@ -138,14 +143,35 @@ func withMetrics(next http.Handler) http.Handler {
 	})
 }
 
+// withCORS 为全部响应附加受限 CORS 头（ADR-0012）：控制台可从任意节点加载，
+// 其写请求经 307 跳 Leader 属跨源请求，浏览器要求目标响应带 CORS 头才放行携带
+// Authorization 重发。token 经请求头携带而非 cookie，故通配来源不引入凭据语义；
+// OPTIONS 预检在路由与认证之前短路返回。
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		h.Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /v1/namespaces/{ns}/configs/{data_id}", s.handlePublish)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}", s.handleGet)
-	mux.HandleFunc("DELETE /v1/namespaces/{ns}/configs/{data_id}", s.handleDelete)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/versions", s.handleVersions)
-	mux.HandleFunc("POST /v1/namespaces/{ns}/configs/{data_id}/rollback", s.handleRollback)
 	mux.HandleFunc("GET /v1/namespaces/{ns}/configs/{data_id}/watch", s.handleWatch)
+	mux.HandleFunc("GET /v1/namespaces/{ns}/configs", s.handleListConfigs)
+	mux.HandleFunc("GET /v1/namespaces", s.handleListNamespaces)
+	mux.HandleFunc("DELETE /v1/namespaces/{ns}/configs/{data_id}", s.handleDelete)
+	mux.HandleFunc("POST /v1/namespaces/{ns}/configs/{data_id}/rollback", s.handleRollback)
 	mux.HandleFunc("POST /v1/cluster/join", s.handleJoin)
 	mux.HandleFunc("GET /v1/cluster/status", s.handleStatus)
 	mux.HandleFunc("DELETE /v1/cluster/peers/{node_id}", s.handleRemovePeer)
@@ -154,7 +180,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.Handler())
-	return withMetrics(mux)
+	// GET / 是 ServeMux 通配兜底：精确模式按特异性优先，API 路径不受遮蔽（ADR-0012）。
+	if s.console != nil {
+		mux.Handle("GET /", s.console)
+	}
+	return withCORS(withMetrics(mux))
 }
 
 // writeGate 是写与集群管理接口的前置门（DESIGN §4.1）：Leader 放行；
@@ -415,6 +445,73 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleListNamespaces 返回仍有存活条目的 Namespace 去重清单（DESIGN §5.1，读本机 PG）。
+func (s *Server) handleListNamespaces(w http.ResponseWriter, r *http.Request) {
+	if !s.ready() {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "restoring"})
+		return
+	}
+	namespaces, err := s.store.ListNamespaces(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespaces": namespaces})
+}
+
+// handleListConfigs 返回条目列表（DESIGN §5.1，读本机 PG）：仅存活条目，
+// data_id 字典序 keyset 分页；响应为元数据（不含 content），next_after_id 为
+// 下一页游标，本页不满 limit 时省略（已到末尾）。
+func (s *Server) handleListConfigs(w http.ResponseWriter, r *http.Request) {
+	if !s.ready() {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "restoring"})
+		return
+	}
+	limit := store.DefaultListLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			badRequest(w, fmt.Errorf("limit 必须是整数，得到 %q", raw))
+			return
+		}
+		// 游标判定须与存储层同一收敛结果，否则 limit=0/超上限时满页误判丢 next_after_id。
+		limit = store.ClampListLimit(v)
+	}
+	var after *string
+	if raw := r.URL.Query().Get("after_id"); raw != "" {
+		after = &raw
+	}
+
+	entries, err := s.store.ListEntries(r.Context(), r.PathValue("ns"), limit, after)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal", "message": err.Error()})
+		return
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		tags := e.Tags
+		if tags == nil {
+			tags = map[string]string{}
+		}
+		out = append(out, map[string]any{
+			"namespace":  e.Namespace,
+			"data_id":    e.DataId,
+			"data_type":  e.DataType,
+			"version":    e.Version,
+			"tags":       tags,
+			"created_at": e.CreatedAt,
+			"updated_at": e.UpdatedAt,
+		})
+	}
+	resp := map[string]any{"entries": out}
+	if len(entries) == limit && len(entries) > 0 {
+		resp["next_after_id"] = entries[len(entries)-1].DataId
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleGet 读当前条目（本机 PG，允许陈旧；DESIGN §5.1）。

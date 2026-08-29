@@ -39,6 +39,14 @@ type Store interface {
 	// beforeVersion 非 nil 时仅返回 version 小于它的记录。
 	ListHistory(ctx context.Context, namespace, dataId string, limit int, beforeVersion *int64) ([]HistoryRecord, error)
 
+	// ListEntries 按 data_id 字典序分页返回 Namespace 下存活条目的元数据（不含 content，
+	// DESIGN §5.1）；afterID 非 nil 时仅返回 data_id 大于它的条目（keyset 分页）。
+	// 已删除条目无当前行，天然不出现。
+	ListEntries(ctx context.Context, namespace string, limit int, afterID *string) ([]EntryMeta, error)
+
+	// ListNamespaces 返回仍有存活条目的 Namespace 去重清单（字典序，DESIGN §5.1）。
+	ListNamespaces(ctx context.Context) ([]string, error)
+
 	// ApplyPublish 应用 op=publish：CAS 判定 → upsert 当前条目 + 追加 History +
 	// 推进步度。CAS 失败等拒绝结果也是已提交日志，须推进进度。
 	ApplyPublish(ctx context.Context, d raftlog.PublishData, index, term uint64) (raftlog.Result, error)
@@ -107,8 +115,36 @@ type HistoryRecord struct {
 	CreatedAt time.Time
 }
 
-// DefaultHistoryLimit 与 MaxHistoryLimit 是 History 查询的默认与上限页大小（DESIGN §5.1）。
+// EntryMeta 是 Config Entry 的列表元数据视图（不含 content，DESIGN §5.1）——
+// 条目列表分页用，避免列表页拖入整页内容体。
+type EntryMeta struct {
+	Namespace string
+	DataId    string
+	DataType  string
+	Version   int64
+	Tags      map[string]string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// DefaultHistoryLimit 与 MaxHistoryLimit 是 History 查询的默认与上限页大小（DESIGN §5.1）；
+// DefaultListLimit 与 MaxListLimit 是条目列表查询的默认与上限页大小。
 const (
 	DefaultHistoryLimit = 50
 	MaxHistoryLimit     = 1000
+	DefaultListLimit    = 100
+	MaxListLimit        = 1000
 )
+
+// ClampListLimit 将条目列表页大小收敛到生效值：≤0 取默认，超过上限收敛。
+// API 层计算分页游标（是否满页）必须使用同一收敛结果，避免以未收敛的
+// 原始 limit 误判满页而丢 next_after_id。
+func ClampListLimit(limit int) int {
+	if limit <= 0 {
+		return DefaultListLimit
+	}
+	if limit > MaxListLimit {
+		return MaxListLimit
+	}
+	return limit
+}

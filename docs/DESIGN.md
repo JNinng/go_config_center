@@ -188,7 +188,7 @@ Raft 没有"通知节点已被移除"的机制。成员表（hashicorp/raft 称 
 
 ## 5. API 规范
 
-所有响应为 JSON。写接口与集群管理接口要求 `Authorization: Bearer <admin_token>`；读接口与内部接口不认证（部署于可信内网）。
+所有响应为 JSON。写接口与集群管理接口要求 `Authorization: Bearer <admin_token>`；读接口与内部接口不认证（部署于可信内网）。全部响应附带受限 CORS 头（`Access-Control-Allow-Origin: *`、允许 `Authorization`/`Content-Type`、OPTIONS 预检 204）——控制台（§5.5）从任意节点加载时，写请求经 307 跳 Leader 属跨源请求；token 经请求头携带而非 cookie，通配来源不引入凭据语义（ADR-0012）。
 
 ### 5.1 配置管理
 
@@ -200,7 +200,8 @@ Raft 没有"通知节点已被移除"的机制。成员表（hashicorp/raft 称 
 | `GET /v1/namespaces/{ns}/configs/{data_id}/versions?limit=50&before_version=` | History 倒序分页 |
 | `POST /v1/namespaces/{ns}/configs/{data_id}/rollback` | body `{to_version}`。200 `{version}`；404 条目从未存在；409 目标无效 |
 | `GET /v1/namespaces/{ns}/configs/{data_id}/watch?v=N&timeout=30s` | 见 4.3 |
-| `GET /v1/namespaces/{ns}/configs?limit=100&after_id=` | 条目列表（运维/检索用） |
+| `GET /v1/namespaces` | 仍有存活条目的 Namespace 去重清单（字典序） |
+| `GET /v1/namespaces/{ns}/configs?limit=100&after_id=` | 条目列表：仅存活条目，data_id 字典序 keyset 分页；响应 `{entries: [<元数据，不含 content>], next_after_id?}`，本页不满 limit 时省略 `next_after_id`（已到末尾） |
 
 Namespace 隐式创建（首次 Publish 即生效），无独立管理接口。
 
@@ -224,6 +225,15 @@ Namespace 隐式创建（首次 Publish 即生效），无独立管理接口。
 | `/healthz` | 进程存活 + PG 可连 |
 | `/readyz` | Serving 门闩为 true 且 Raft 非 Shutdown；LB 据此摘流 |
 | `/metrics` | Prometheus 格式，见 §7 |
+
+### 5.5 控制台
+
+控制台（CONTEXT.md「控制台」）是内嵌于二进制的 Web 管理界面（ADR-0012）：
+
+- 构建期以 Vite + Vue 3 产出静态资源（`web/console/` → `scripts/build-console.sh` → `internal/console/dist/`），`go:embed` 内嵌，运行期零外部依赖；dist 不入库，未构建时 `/` 返回占位页。
+- 挂载于根路径：`GET /` 为 ServeMux 通配兜底，精确注册的 API 路径按特异性优先不受遮蔽；dist 内不存在的路径回退 index.html（SPA fallback）。挂载后未注册路径的 POST 由 404 变为 405（命中 `GET /` 模式但方法不符，ServeMux 语义）。
+- 控制台静态资源不鉴权（与读接口同属内网信任模型）；写操作由使用者在页面内提供 admin_token，经 `Authorization` 头携带，存于浏览器 localStorage。
+- 页面发布/删除均自动携带 Expected Version（CAS），冲突时展示当前版本并要求刷新。
 
 ## 6. 配置与部署
 
@@ -341,5 +351,6 @@ config-center --config config.yaml
 | 日志存储 | hashicorp/raft-boltdb |
 | 数据库/驱动 | PostgreSQL + pgx（连接池） |
 | HTTP | net/http 标准库（Go 1.22+ 路由） |
+| 控制台 | Vue 3 + Vite + TypeScript（构建期 node）；`go:embed` 内嵌，运行期零依赖（ADR-0012） |
 | 序列化 | JSON（日志信封带格式版本号） |
 | 指标 | Prometheus client_golang |

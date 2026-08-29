@@ -63,3 +63,7 @@ _Avoid_: force-bootstrap、自举
 **Tombstone**:
 History 中 op=delete 的记录，不含配置内容；Rollback 到其之前的任意版本可重建条目。
 _Avoid_: 软删除、删除标记
+
+**控制台**:
+内嵌于服务二进制的 Web 管理界面：浏览 Config Entry、执行 Publish/Delete/Rollback、查看 History 与成员表。
+_Avoid_: 管理页面、Admin UI、Dashboard

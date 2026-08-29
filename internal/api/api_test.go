@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -861,4 +862,186 @@ func TestRemovePeerEndpoint(t *testing.T) {
 		t.Fatalf("follower 移除 = %d, want 307", resp.StatusCode)
 	}
 	followerTS.Close()
+}
+
+// 条目列表与 Namespace 清单端点（DESIGN §5.1）：仅存活条目、keyset 分页、
+// 响应不含 content、next_after_id 到末尾省略；Serving 门闩关闭时 503。
+func TestListConfigsAndNamespacesEndpoints(t *testing.T) {
+	st := mustStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"b", "a", "c"} {
+		if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: id, DataType: "TEXT", Content: "body-of-" + id}, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "prod", DataId: "a", DataType: "TEXT", Content: "x"}, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := st.ApplyDelete(ctx, raftlog.DeleteData{Namespace: "dev", DataId: "b"}, 0, 0); err != nil || res.Status != raftlog.StatusOK {
+		t.Fatalf("delete = %+v %v", res, err)
+	}
+
+	ready := &atomic.Bool{}
+	ts := httptest.NewServer(New(Deps{Store: st, AdminToken: "tok", Ready: func() bool { return ready.Load() }}).Routes())
+	defer ts.Close()
+	ready.Store(true)
+
+	resp, err := http.Get(ts.URL + "/v1/namespaces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var nsBody struct {
+		Namespaces []string `json:"namespaces"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nsBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(nsBody.Namespaces) != 2 || nsBody.Namespaces[0] != "dev" || nsBody.Namespaces[1] != "prod" {
+		t.Fatalf("namespaces = %v, want [dev prod]", nsBody.Namespaces)
+	}
+
+	getList := func(t *testing.T, query string) (map[string]any, []map[string]any) {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/v1/namespaces/dev/configs" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET configs%s = %d, want 200", query, resp.StatusCode)
+		}
+		var body struct {
+			Entries     []map[string]any `json:"entries"`
+			NextAfterID string           `json:"next_after_id"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return map[string]any{"next": body.NextAfterID}, body.Entries
+	}
+
+	_, entries := getList(t, "?limit=2")
+	if len(entries) != 2 || entries[0]["data_id"] != "a" || entries[1]["data_id"] != "c" {
+		t.Fatalf("entries = %v, want [a c]（b 已删除不出现）", entries)
+	}
+	if _, ok := entries[0]["content"]; ok {
+		t.Fatalf("列表元数据不应含 content 字段: %v", entries[0])
+	}
+	if entries[0]["version"] != float64(1) || entries[0]["data_type"] != "TEXT" {
+		t.Fatalf("元数据 = %v", entries[0])
+	}
+
+	meta, _ := getList(t, "?limit=1")
+	if meta["next"] != "a" {
+		t.Fatalf("next_after_id = %v, want a", meta["next"])
+	}
+	meta, entries = getList(t, "?limit=1&after_id=a")
+	if len(entries) != 1 || entries[0]["data_id"] != "c" {
+		t.Fatalf("after_id=a = %v, want [c]", entries)
+	}
+	if meta["next"] != "c" {
+		t.Fatalf("next_after_id = %v, want c", meta["next"])
+	}
+
+	// limit 参数非法 → 400；门闩关闭 → 503。
+	resp, err = http.Get(ts.URL + "/v1/namespaces/dev/configs?limit=abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("limit=abc = %d, want 400", resp.StatusCode)
+	}
+	ready.Store(false)
+	resp, err = http.Get(ts.URL + "/v1/namespaces/dev/configs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("门闩关闭 = %d, want 503", resp.StatusCode)
+	}
+}
+
+// CORS（ADR-0012）：全部响应带许可头，OPTIONS 预检在路由与认证之前 204 短路。
+func TestCORSHeaders(t *testing.T) {
+	st := mustStore(t)
+	ts := httptest.NewServer(New(Deps{Store: st, AdminToken: "tok", Ready: func() bool { return true }}).Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("GET /healthz 缺 Access-Control-Allow-Origin: %v", resp.Header)
+	}
+
+	req, _ := http.NewRequest(http.MethodOptions, ts.URL+"/v1/namespaces/dev/configs", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	req.Header.Set("Access-Control-Request-Headers", "authorization, content-type")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("OPTIONS 预检 = %d, want 204", resp.StatusCode)
+	}
+	if resp.Header.Get("Access-Control-Allow-Headers") == "" || resp.Header.Get("Access-Control-Allow-Methods") == "" {
+		t.Fatalf("预检响应缺许可头: %v", resp.Header)
+	}
+}
+
+// 控制台挂载（ADR-0012）：GET / 由 Console handler 兜底，API 精确路径不受遮蔽。
+func TestConsoleMountDoesNotShadowAPI(t *testing.T) {
+	st := mustStore(t)
+	console := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html><body>console-stub</body></html>"))
+	})
+	ts := httptest.NewServer(New(Deps{Store: st, AdminToken: "tok", Ready: func() bool { return true }, Console: console}).Routes())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(b), "console-stub") {
+		t.Fatalf("GET / = %d %q, want 控制台兜底", resp.StatusCode, string(b))
+	}
+
+	resp, err = http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("GET /healthz = %d, want 200 JSON（不被控制台遮蔽）", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/v1/namespaces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/namespaces = %d, want 200", resp.StatusCode)
+	}
+
+	// 未注册路径被 GET / 通配覆盖后，POST 命中该模式但方法不符 → 405（ServeMux 语义，
+	// 挂载控制台前为 404）；已注册写路径不受影响。
+	resp, err = http.Post(ts.URL+"/not-registered", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /not-registered = %d, want 405", resp.StatusCode)
+	}
 }

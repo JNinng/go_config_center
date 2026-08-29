@@ -510,3 +510,82 @@ func TestMigrateIdempotent(t *testing.T) {
 		t.Fatalf("二次 Migrate: %v", err)
 	}
 }
+
+// 条目列表（DESIGN §5.1）：data_id 字典序、keyset 分页、已删除条目不出现、
+// limit 收敛与元数据不含 content。
+func TestListEntriesKeysetPagination(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+	for _, id := range []string{"b", "a", "c"} {
+		if _, err := st.ApplyPublish(ctx, pub(t.Name(), id, "content-of-"+id, nil), 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if res, err := st.ApplyDelete(ctx, del(t.Name(), "b", nil), 0, 0); err != nil || res.Status != raftlog.StatusOK {
+		t.Fatalf("delete b = %+v %v", res, err)
+	}
+
+	names := func(entries []store.EntryMeta) []string {
+		out := make([]string, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, e.DataId)
+		}
+		return out
+	}
+
+	page1, err := st.ListEntries(ctx, t.Name(), 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(page1); len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Fatalf("第一页 = %v, want [a c]（b 已删除不出现）", got)
+	}
+	if page1[0].Version != 1 || page1[0].DataType != "TEXT" {
+		t.Fatalf("元数据 = %+v", page1[0])
+	}
+
+	page2, err := st.ListEntries(ctx, t.Name(), 2, &page1[1].DataId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(page2); len(got) != 0 {
+		t.Fatalf("第二页 = %v, want 空", got)
+	}
+
+	// limit ≤0 取默认值，超过上限收敛。
+	if n, err := st.ListEntries(ctx, t.Name(), 0, nil); err != nil || len(n) != 2 {
+		t.Fatalf("limit=0 = %d 条 %v, want 默认页大小下的 2 条", len(n), err)
+	}
+	if n, err := st.ListEntries(ctx, t.Name(), store.MaxListLimit+1, nil); err != nil || len(n) != 2 {
+		t.Fatalf("limit 超上限 = %d 条 %v, want 收敛后 2 条", len(n), err)
+	}
+}
+
+// Namespace 清单：去重、字典序、条目全部删除的 Namespace 不出现。
+func TestListNamespacesDistinctOrdered(t *testing.T) {
+	st, _ := mustOpen(t)
+	ctx := context.Background()
+	for _, ns := range []string{"prod", "dev", "dev"} {
+		if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v1", nil), 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.ListNamespaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "dev" || got[1] != "prod" {
+		t.Fatalf("namespaces = %v, want [dev prod]", got)
+	}
+
+	if _, err := st.ApplyDelete(ctx, del("dev", "a", nil), 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.ListNamespaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "prod" {
+		t.Fatalf("dev 清空后 namespaces = %v, want [prod]", got)
+	}
+}

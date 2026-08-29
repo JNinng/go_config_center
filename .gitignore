@@ -34,3 +34,7 @@ config.yaml
 
 # e2e 多节点拓扑数据目录
 data-*/
+
+# 控制台构建产物（.keep 仅保证 go:embed 目录存在，ADR-0012）
+internal/console/dist/*
+!internal/console/dist/.keep

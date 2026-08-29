@@ -436,6 +436,65 @@ func (s *Store) ListHistory(ctx context.Context, namespace, dataId string, limit
 	return records, nil
 }
 
+// ListEntries 按 data_id 字典序分页返回存活条目元数据（DESIGN §5.1）。
+// biz_configs 仅存存活行，已删除（Tombstone）条目天然不出现；
+// afterID 非 nil 时仅返回 data_id 大于它的条目；页大小经 store.ClampListLimit 收敛。
+func (s *Store) ListEntries(ctx context.Context, namespace string, limit int, afterID *string) ([]store.EntryMeta, error) {
+	limit = store.ClampListLimit(limit)
+	rows, err := s.pool.Query(ctx, `
+		SELECT namespace, data_id, data_type, version, tags, created_at, updated_at
+		FROM biz_configs
+		WHERE namespace = $1 AND ($2::text IS NULL OR data_id > $2)
+		ORDER BY data_id
+		LIMIT $3`, namespace, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("查询条目列表: %w", err)
+	}
+	defer rows.Close()
+
+	entries := make([]store.EntryMeta, 0)
+	for rows.Next() {
+		var e store.EntryMeta
+		var tags []byte
+		if err := rows.Scan(&e.Namespace, &e.DataId, &e.DataType, &e.Version, &tags, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("读取条目: %w", err)
+		}
+		if tags != nil {
+			if err := json.Unmarshal(tags, &e.Tags); err != nil {
+				return nil, fmt.Errorf("解析 tags: %w", err)
+			}
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历条目列表: %w", err)
+	}
+	return entries, nil
+}
+
+// ListNamespaces 返回仍有存活条目的 Namespace 去重清单（字典序）；
+// 条目全部删除的 Namespace 不出现（控制台侧栏无物可展示）。
+func (s *Store) ListNamespaces(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT namespace FROM biz_configs ORDER BY namespace`)
+	if err != nil {
+		return nil, fmt.Errorf("查询 Namespace: %w", err)
+	}
+	defer rows.Close()
+
+	namespaces := make([]string, 0)
+	for rows.Next() {
+		var ns string
+		if err := rows.Scan(&ns); err != nil {
+			return nil, fmt.Errorf("读取 Namespace: %w", err)
+		}
+		namespaces = append(namespaces, ns)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历 Namespace: %w", err)
+	}
+	return namespaces, nil
+}
+
 // AdvanceMeta 仅推进 raft_fsm_meta，用于信封损坏或 op 未实现但日志已提交的场景，
 // 保证 last_applied_index 无空洞。
 func (s *Store) AdvanceMeta(ctx context.Context, index, term uint64) error {
