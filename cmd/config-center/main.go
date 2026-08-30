@@ -215,7 +215,10 @@ func main() {
 	clusterInfo := func() api.ClusterInfo {
 		role := strings.ToLower(r.State().String())
 		leaderAddr, leaderID := r.LeaderWithID()
-		term, _ := strconv.ParseUint(r.Stats()["term"], 10, 64)
+		stats := r.Stats()
+		term, _ := strconv.ParseUint(stats["term"], 10, 64)
+		lastLogIndex, _ := strconv.ParseUint(stats["last_log_index"], 10, 64)
+		commitIndex, _ := strconv.ParseUint(stats["commit_index"], 10, 64)
 		httpAddr := ""
 		if role == "leader" {
 			httpAddr = cfg.HTTPAdvertise
@@ -224,38 +227,105 @@ func main() {
 				httpAddr = v
 			}
 		}
+		// 到 Leader 的最近心跳（api.go LastContactMS 语义：Leader=0，从未=-1）。
+		lastContactMS := int64(0)
+		if role != "leader" {
+			last := r.LastContact()
+			if last.IsZero() {
+				lastContactMS = -1
+			} else {
+				lastContactMS = time.Since(last).Milliseconds()
+			}
+		}
 		lastApplied, _ := machine.LastApplied()
 		return api.ClusterInfo{
-			NodeID:      nodeID,
-			Role:        role,
-			Term:        term,
-			LeaderID:    string(leaderID),
-			LeaderAddr:  string(leaderAddr),
-			LeaderHTTP:  httpAddr,
-			LastApplied: lastApplied,
-			Restoring:   !machine.Serving(),
+			NodeID:        nodeID,
+			Role:          role,
+			Term:          term,
+			LeaderID:      string(leaderID),
+			LeaderAddr:    string(leaderAddr),
+			LeaderHTTP:    httpAddr,
+			LastApplied:   lastApplied,
+			LastLogIndex:  lastLogIndex,
+			CommitIndex:   commitIndex,
+			LastContactMS: lastContactMS,
+			Restoring:     !machine.Serving(),
 		}
+	}
+	var peerHTTP sync.Map // ServerID → HTTP 基地址（Join 时登记，供移除护栏探活与成员表自报探测）
+
+	// peerReport 经成员的 /internal/discovery 自报填充成员行（状态/指标列，DESIGN §5.2）；
+	// 地址未知或非 200 时保持缺省（=未知），失效方向与移除护栏一致（不误报在线）。
+	peerReport := func(peerID string, m *api.MemberInfo) {
+		v, ok := peerHTTP.Load(peerID)
+		if !ok {
+			return
+		}
+		client := &http.Client{Timeout: 1500 * time.Millisecond}
+		resp, err := client.Get(v.(string) + "/internal/discovery")
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+		var d struct {
+			Role          string `json:"role"`
+			Term          uint64 `json:"term"`
+			LastLogIndex  uint64 `json:"last_log_index"`
+			CommitIndex   uint64 `json:"commit_index"`
+			AppliedIndex  uint64 `json:"applied_index"`
+			LastContactMS int64  `json:"last_contact_ms"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+			return
+		}
+		online := true
+		m.Online, m.Role, m.Term = &online, d.Role, d.Term
+		m.LastLogIndex, m.CommitIndex, m.AppliedIndex = d.LastLogIndex, d.CommitIndex, d.AppliedIndex
+		m.LastContactMS = d.LastContactMS
 	}
 	members := func() ([]api.MemberInfo, error) {
 		f := r.GetConfiguration()
 		if err := f.Error(); err != nil {
 			return nil, fmt.Errorf("读取成员表: %w", err)
 		}
-		out := make([]api.MemberInfo, 0, len(f.Configuration().Servers))
-		for _, srv := range f.Configuration().Servers {
+		servers := f.Configuration().Servers
+		out := make([]api.MemberInfo, 0, len(servers))
+		for _, srv := range servers {
 			out = append(out, api.MemberInfo{
 				NodeID:   string(srv.ID),
 				Addr:     string(srv.Address),
 				Suffrage: srv.Suffrage.String(),
 			})
 		}
+		// 成员自报信息（DESIGN §5.2）：本节点行直接取本地指标；其余成员经
+		// /internal/discovery 并发探测填充，地址未知或探测失败保持缺省（=未知）。
+		info := clusterInfo()
+		var probeWG sync.WaitGroup
+		for i := range out {
+			if servers[i].ID == raft.ServerID(nodeID) {
+				online := true
+				out[i].Role, out[i].Term = info.Role, info.Term
+				out[i].LastLogIndex, out[i].CommitIndex = info.LastLogIndex, info.CommitIndex
+				out[i].AppliedIndex, out[i].LastContactMS = info.LastApplied, info.LastContactMS
+				out[i].Online = &online
+				continue
+			}
+			probeWG.Add(1)
+			go func(m *api.MemberInfo, peerID string) {
+				defer probeWG.Done()
+				peerReport(peerID, m)
+			}(&out[i], string(servers[i].ID))
+		}
+		probeWG.Wait()
 		return out, nil
 	}
 	// joinFn 在 Leader 上执行成员加入。同 Node ID 换地址时按新地址覆盖（幂等语义）。
 	// 注：加入即 voter——hashicorp/raft 只在提案文档 membership.md 里设计过 staging
 	//（先以非投票身份加入、追平后自动转 voter），从未实现；AddVoter 直接赋予投票权，
 	// 与 Consul 等生产用法一致（DESIGN §4.5 注记）。
-	var peerHTTP sync.Map // ServerID → HTTP 基地址（Join 时登记，供移除护栏探活）
 	joinFn := func(peerID, peerRaftAddr, peerHTTPAddr string) (bool, error) {
 		f := r.GetConfiguration()
 		if err := f.Error(); err != nil {

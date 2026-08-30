@@ -103,6 +103,14 @@ export interface Member {
   node_id: string
   addr: string
   suffrage: string
+  // 尽力而为的自报信息（DESIGN §5.2）：缺省 = 当前节点视角未知
+  role?: string
+  term?: number
+  last_log_index?: number
+  commit_index?: number
+  applied_index?: number
+  last_contact_ms?: number
+  online?: boolean
 }
 
 export interface ClusterStatus {
@@ -113,6 +121,9 @@ export interface ClusterStatus {
   leader_addr: string
   leader_http_addr: string
   last_applied_index: number
+  last_log_index?: number
+  commit_index?: number
+  last_contact_ms?: number
   restoring: boolean
   members: Member[]
 }

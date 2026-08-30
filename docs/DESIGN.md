@@ -211,14 +211,14 @@ Namespace 隐式创建（首次 Publish 即生效），无独立创建接口—�
 
 | 方法与路径 | 语义 |
 |---|---|
-| `GET /v1/cluster/status` | 本节点视角：`{node_id, role, term, leader_id, leader_addr, leader_http_addr, last_applied_index, restoring, members: [{node_id, addr, role, suffrage}]}`。任意节点可调 |
+| `GET /v1/cluster/status` | 本节点视角：`{node_id, role, term, leader_id, leader_addr, leader_http_addr, last_applied_index, last_log_index, commit_index, last_contact_ms, restoring, members: [{node_id, addr, suffrage, role?, term?, last_log_index?, commit_index?, applied_index?, last_contact_ms?, online?}]}`。任意节点可调。`last_contact_ms`：到 Leader 的最近心跳毫秒数，0=自身为 Leader，-1=从未收到心跳。成员行自报字段尽力而为：本节点行必有；其余成员经 `/internal/discovery` 探测（HTTP 地址需本节点 Join 时登记过）填充，缺省 = 本节点视角未知，`online` 仅区分已知在线/无响应，不臆断离线成员已下线 |
 | `POST /v1/cluster/join` | body `{node_id, raft_addr, http_addr?}`（http_addr 登记后供移除护栏探活）。202 已受理；幂等 200 |
 | `POST /v1/cluster/snapshot` | 手动触发 FSM 快照（§4.4"达到阈值或手动触发"）。200 `{status:"ok", snapshot_index}`；快照点之后无新日志时再触发 200 `{status:"noop"}` |
 | `DELETE /v1/cluster/peers/{node_id}` | 移除成员。200；409 护栏拒绝；404 非成员 |
 
 ### 5.3 内部接口（不认证）
 
-`GET /internal/discovery` → `{node_id, role, leader_addr, leader_http_addr}`（role ∈ leader/follower/candidate）。调用方：发现代理（寻找 Leader）与移除护栏（探活）。
+`GET /internal/discovery` → `{node_id, role, leader_addr, leader_http_addr, term, last_log_index, commit_index, applied_index, last_contact_ms}`（role ∈ leader/follower/candidate）。调用方：发现代理（寻找 Leader）、移除护栏（探活）与 `/v1/cluster/status` 的成员自报合并（§5.2）。
 
 ### 5.4 运维端点
 

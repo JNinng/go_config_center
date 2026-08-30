@@ -42,6 +42,23 @@ function roleBadge(suffrage: string): string {
   return 'badge accent'
 }
 
+// last_contact_ms 语义见 api.go：0=Leader 自身（无意义），-1=从未收到心跳，undefined=未知。
+function lastContact(ms?: number): string {
+  if (ms === undefined || ms === 0) return '—'
+  if (ms < 0) return '从未'
+  return ms < 1000 ? `${ms}ms 前` : `${(ms / 1000).toFixed(1)}s 前`
+}
+
+// 复制滞后 = 日志末端 - 已提交；FSM 滞后 = 已提交 - 已应用。任一端未知则无法计算。
+function lag(from?: number, to?: number): string {
+  return from === undefined || to === undefined ? '—' : String(from - to)
+}
+
+function onlineBadge(m: Member): string {
+  if (m.online === undefined) return 'badge'
+  return m.online ? 'badge ok' : 'badge danger'
+}
+
 // 移除成员（DESIGN §4.5）：写门闸将请求 307 到 Leader 执行；
 // 护栏不满足返回 409，被移除节点停止接收复制并在约 2s 内以退出码 42 退出。
 async function removeMember(m: Member): Promise<void> {
@@ -104,6 +121,9 @@ async function removeMember(m: Member): Promise<void> {
           <tr><th>Leader</th><td class="mono">{{ status.leader_id || '—' }}（{{ status.leader_addr || '地址未知' }}）</td></tr>
           <tr><th>Leader HTTP</th><td class="mono">{{ status.leader_http_addr || '—' }}</td></tr>
           <tr><th>last_applied_index</th><td class="num">{{ status.last_applied_index }}</td></tr>
+          <tr><th>last_log_index</th><td class="num">{{ status.last_log_index ?? '—' }}</td></tr>
+          <tr><th>commit_index</th><td class="num">{{ status.commit_index ?? '—' }}</td></tr>
+          <tr><th>最近心跳（→ Leader）</th><td>{{ lastContact(status.last_contact_ms) }}</td></tr>
         </tbody>
       </table>
     </div>
@@ -120,6 +140,14 @@ async function removeMember(m: Member): Promise<void> {
             <th>Node ID</th>
             <th>Raft 地址</th>
             <th>投票权</th>
+            <th>状态</th>
+            <th class="num">Term</th>
+            <th class="num">已应用</th>
+            <th class="num">已提交</th>
+            <th class="num">日志末端</th>
+            <th class="num">复制滞后</th>
+            <th class="num">FSM 滞后</th>
+            <th>最近心跳</th>
             <th></th>
           </tr>
         </thead>
@@ -132,6 +160,17 @@ async function removeMember(m: Member): Promise<void> {
             </td>
             <td class="mono">{{ m.addr }}</td>
             <td><span :class="roleBadge(m.suffrage)">{{ m.suffrage }}</span></td>
+            <td>
+              <span :class="onlineBadge(m)">{{ m.online === undefined ? '未知' : m.online ? '在线' : '无响应' }}</span>
+              <span v-if="m.role" class="badge" style="margin-left: 4px">{{ m.role }}</span>
+            </td>
+            <td class="num">{{ m.term || '—' }}</td>
+            <td class="num">{{ m.applied_index ?? '—' }}</td>
+            <td class="num">{{ m.commit_index ?? '—' }}</td>
+            <td class="num">{{ m.last_log_index ?? '—' }}</td>
+            <td class="num">{{ lag(m.last_log_index, m.commit_index) }}</td>
+            <td class="num">{{ lag(m.commit_index, m.applied_index) }}</td>
+            <td>{{ lastContact(m.last_contact_ms) }}</td>
             <td class="cell-actions">
               <button class="danger btn-sm" :disabled="removing !== null" @click="removeMember(m)">
                 {{ removing === m.node_id ? '移除中…' : '移除' }}

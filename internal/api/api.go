@@ -46,6 +46,12 @@ type ClusterInfo struct {
 	LeaderHTTP  string // 本节点已知的 Leader HTTP 基地址（可为空；自身为 Leader 时即通告地址）
 	LastApplied uint64
 	Restoring   bool
+
+	// 本节点 Raft 指标（DESIGN §5.2 状态卡与 §5.3 成员自报共用）。
+	LastLogIndex uint64 // Raft 日志末端索引
+	CommitIndex  uint64 // 已提交索引
+	// LastContactMS 是到 Leader 的最近心跳距今毫秒数；0=自身为 Leader，-1=从未收到心跳。
+	LastContactMS int64
 }
 
 // MemberInfo 是成员表中的一条成员（DESIGN §5.2）。
@@ -53,6 +59,16 @@ type MemberInfo struct {
 	NodeID   string `json:"node_id"`
 	Addr     string `json:"addr"`
 	Suffrage string `json:"suffrage"` // Voter | Staging | Nonvoter
+
+	// 以下为尽力而为的自报信息：本节点行直接取本地指标，其余成员经
+	// /internal/discovery 探测填充；字段缺省 = 本节点视角未知（地址未知或探测失败）。
+	Role          string `json:"role,omitempty"` // leader | follower | candidate
+	Term          uint64 `json:"term,omitempty"`
+	LastLogIndex  uint64 `json:"last_log_index,omitempty"`
+	CommitIndex   uint64 `json:"commit_index,omitempty"`
+	AppliedIndex  uint64 `json:"applied_index,omitempty"`
+	LastContactMS int64  `json:"last_contact_ms,omitempty"` // 语义同 ClusterInfo.LastContactMS
+	Online        *bool  `json:"online,omitempty"`          // nil=未知；true=自报成功；false=探测无响应
 }
 
 // JoinFunc 在 Leader 上执行成员加入（AddVoter，DESIGN §4.5）。
@@ -784,7 +800,8 @@ func (s *Server) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDiscovery 供发现代理调用（DESIGN §5.3，不认证）：
-// 返回本节点身份与角色、及其所知 Leader 的 Raft/HTTP 地址。
+// 返回本节点身份与角色、及其所知 Leader 的 Raft/HTTP 地址，附带本节点 Raft
+// 指标自报（成员表状态/指标列经此合并，DESIGN §5.2）。
 func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	if !s.ready() {
 		w.Header().Set("Retry-After", "1")
@@ -797,6 +814,11 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"role":             info.Role,
 		"leader_addr":      info.LeaderAddr,
 		"leader_http_addr": info.LeaderHTTP,
+		"term":             info.Term,
+		"last_log_index":   info.LastLogIndex,
+		"commit_index":     info.CommitIndex,
+		"applied_index":    info.LastApplied,
+		"last_contact_ms":  info.LastContactMS,
 	})
 }
 
@@ -879,6 +901,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"leader_addr":        info.LeaderAddr,
 		"leader_http_addr":   info.LeaderHTTP,
 		"last_applied_index": info.LastApplied,
+		"last_log_index":     info.LastLogIndex,
+		"commit_index":       info.CommitIndex,
+		"last_contact_ms":    info.LastContactMS,
 		"restoring":          info.Restoring,
 		"members":            members,
 	})
