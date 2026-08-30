@@ -293,7 +293,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 func (s *Server) applyFailed(w http.ResponseWriter, res raftlog.Result) {
 	msg := res.Err
 	if res.Status == raftlog.StatusReplayed {
-		msg = fmt.Sprintf("日志 index %d 不大于本节点 FSM 进度——PG 与 Raft 日志非同一 lineage，须按 DESIGN §6.4 重建集群", res.Index)
+		msg = fmt.Sprintf("日志 index %d 不大于本节点 FSM 进度——PG 与 Raft 日志非同一 lineage，须重建集群", res.Index)
 	}
 	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "apply_failed", "message": msg})
 }

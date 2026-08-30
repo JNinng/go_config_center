@@ -108,7 +108,7 @@ func main() {
 	}
 	if metaIdx > raftLastIdx {
 		fatal(logger, "本节点持久化状态不一致（PG 进度越过 Raft 日志末端）", fmt.Errorf(
-			"raft_fsm_meta.last_applied_index=%d > Raft 日志末端 index=%d，两份数据不是同一 lineage，须按 DESIGN §6.4 重建集群", metaIdx, raftLastIdx))
+			"raft_fsm_meta.last_applied_index=%d > Raft 日志末端 index=%d，两份数据不是同一 lineage，须重建集群", metaIdx, raftLastIdx))
 	}
 
 	raftCfg := raft.DefaultConfig()
@@ -131,10 +131,10 @@ func main() {
 		if idx, _, err := st.LoadMeta(ctx); err != nil {
 			fatal(logger, "读取 FSM 进度", err)
 		} else if idx > 0 {
-			fatal(logger, "--bootstrap 拒绝执行", fmt.Errorf("PG raft_fsm_meta.last_applied_index=%d > 0，要求空库（灾难恢复流程见 DESIGN §6.4）", idx))
+			fatal(logger, "--bootstrap 拒绝执行", fmt.Errorf("PG raft_fsm_meta.last_applied_index=%d > 0，要求空库；灾难恢复须选数据最新的节点清零 raft_fsm_meta 后再 --bootstrap 重建集群", idx))
 		}
 	}
-	// 非 bootstrap 节点不再因无集群态而退出：由发现代理经 Seed List 加入（ADR-0008，
+	// 非 bootstrap 节点不因无集群态而退出：由发现代理经 Seed List 加入（ADR-0008，
 	// 永不自举）；已有状态的节点重启后仍是成员（成员表随 Raft 日志持久化），
 	// 发现代理跳过 Join、仅跟踪 Leader 地址。
 
