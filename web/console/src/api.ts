@@ -172,6 +172,11 @@ export function clusterStatus(): Promise<ClusterStatus> {
   return api('GET', '/v1/cluster/status', undefined, { auth: true })
 }
 
+/** 移除成员（DESIGN §5.2）：Leader 执行前做 quorum 护栏校验，409 = 护栏拒绝。 */
+export function removePeer(nodeId: string): Promise<{ status: string }> {
+  return api('DELETE', `/v1/cluster/peers/${encodeURIComponent(nodeId)}`, undefined, { auth: true })
+}
+
 export function fmtTime(iso: string): string {
   return new Date(iso).toLocaleString()
 }
