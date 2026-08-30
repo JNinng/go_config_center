@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
-import { getToken, setToken, unauthorized, deleteNamespace, listNamespaces } from './api'
+import { clearToken, hasToken, setToken, unauthorized, deleteNamespace, listNamespaces } from './api'
 import { route } from './router'
 import ConfigList from './pages/ConfigList.vue'
 import ConfigDetail from './pages/ConfigDetail.vue'
@@ -8,6 +8,8 @@ import Cluster from './pages/Cluster.vue'
 
 const namespaces = ref<string[]>([])
 const nsError = ref('')
+// 侧栏操作的成功反馈与错误分通道展示，成功不冒充报错样式。
+const nsNotice = ref('')
 const tokenInput = ref('')
 const showNewNs = ref(false)
 const newNs = ref('')
@@ -55,13 +57,14 @@ async function removeNs(ns: string): Promise<void> {
     nsError.value = '输入不一致，已取消'
     return
   }
+  nsNotice.value = ''
   try {
     const res = await deleteNamespace(ns)
     if ((route.value.name === 'list' || route.value.name === 'detail') && route.value.ns === ns) {
       location.hash = '#/'
     }
     await refreshNamespaces()
-    nsError.value = `已删除「${ns}」（${res.entries} 条，可回滚）`
+    nsNotice.value = `已删除「${ns}」（${res.entries} 条，可回滚）`
   } catch (e) {
     nsError.value = (e as Error).message
   }
@@ -73,6 +76,12 @@ function saveToken(): void {
     tokenInput.value = ''
     refreshNamespaces()
   }
+}
+
+// 更换 token：清除已保存值，主区重新出现输入面板。
+function resetToken(): void {
+  clearToken()
+  tokenInput.value = ''
 }
 
 const isListActive = (ns: string): boolean =>
@@ -96,12 +105,15 @@ const isListActive = (ns: string): boolean =>
       <button class="ns-del" title="删除 Namespace" @click="removeNs(ns)">×</button>
     </div>
     <div v-if="nsError" class="error" style="margin: 8px 16px">{{ nsError }}</div>
+    <div v-if="nsNotice" class="hint" style="margin: 8px 16px; overflow-wrap: anywhere">{{ nsNotice }}</div>
     <div class="side-label">集群</div>
     <a href="#/cluster" :class="{ active: route.name === 'cluster' }">实例与状态</a>
+    <div class="side-label">管理</div>
+    <button class="side-token" title="清除已保存的 token 并重新输入" @click="resetToken">更换 admin_token</button>
   </nav>
 
   <main class="main">
-    <div v-if="!getToken() || unauthorized" class="panel">
+    <div v-if="!hasToken || unauthorized" class="panel">
       <div v-if="unauthorized" class="error">认证失败或 token 缺失（401），请重新提供 admin_token。</div>
       <label>admin_token（写操作与集群状态必需，保存在浏览器 localStorage）</label>
       <div class="token-bar">

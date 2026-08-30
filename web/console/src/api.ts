@@ -4,13 +4,23 @@ import { ref } from 'vue'
 
 const TOKEN_KEY = 'gcc_admin_token'
 
+/** getToken 的响应式镜像：localStorage 本身非响应式，App 层据此判定是否展示 token 输入面板。 */
+export const hasToken = ref(!!localStorage.getItem(TOKEN_KEY))
+
 export function getToken(): string {
   return localStorage.getItem(TOKEN_KEY) ?? ''
 }
 
 export function setToken(token: string): void {
   localStorage.setItem(TOKEN_KEY, token)
+  hasToken.value = true
   unauthorized.value = false
+}
+
+/** 主动清除已保存的 token（侧栏「更换 admin_token」），清后展示输入面板。 */
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_KEY)
+  hasToken.value = false
 }
 
 /** 任一请求收到 401 时置位，由 App 层展示 token 输入；setToken 后复位。 */
@@ -179,6 +189,28 @@ export function removePeer(nodeId: string): Promise<{ status: string }> {
 
 export function fmtTime(iso: string): string {
   return new Date(iso).toLocaleString()
+}
+
+/** 响应式当前时间：每 30s 走针一次，模板经 fmtRelTime 引用它在渲染中建立依赖，相对时间自动保持新鲜。 */
+export const now = ref(Date.now())
+window.setInterval(() => {
+  now.value = Date.now()
+}, 30_000)
+
+/** 友好相对时间：刚刚/N分钟前/N小时前/N天前/N个月前/N年前；未来时间（时钟偏差）视为刚刚。 */
+export function fmtRelTime(iso: string): string {
+  const t = new Date(iso).getTime()
+  if (Number.isNaN(t)) return '—'
+  const diff = now.value - t
+  const minute = 60_000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (diff < minute) return '刚刚'
+  if (diff < hour) return `${Math.floor(diff / minute)}分钟前`
+  if (diff < day) return `${Math.floor(diff / hour)}小时前`
+  if (diff < 30 * day) return `${Math.floor(diff / day)}天前`
+  if (diff < 365 * day) return `${Math.floor(diff / (30 * day))}个月前`
+  return `${Math.floor(diff / (365 * day))}年前`
 }
 
 /** data_type=JSON 时本地格式校验；返回错误信息，合法返回空串。 */

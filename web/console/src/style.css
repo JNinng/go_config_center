@@ -26,7 +26,7 @@ body {
 
 #app {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
 }
 
 .sidebar {
@@ -35,6 +35,7 @@ body {
   background: var(--panel);
   border-right: 1px solid var(--border);
   padding: 16px 0;
+  overflow-y: auto;
 }
 
 .sidebar h1 {
@@ -43,6 +44,9 @@ body {
 }
 
 .sidebar .side-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   font-size: 12px;
   color: var(--muted);
   padding: 8px 16px 4px;
@@ -67,8 +71,6 @@ body {
 }
 
 .side-add {
-  float: right;
-  margin-right: 12px;
   padding: 0 7px;
   line-height: 18px;
   border-radius: 4px;
@@ -76,20 +78,31 @@ body {
 
 .side-new {
   display: flex;
+  flex-direction: column;
   gap: 6px;
-  padding: 0 12px 8px;
+  padding: 0 16px 8px;
 }
 
 .side-new input {
-  flex: 1;
-  min-width: 0;
+  width: 100%;
   font-size: 13px;
-  padding: 3px 6px;
+  padding: 5px 8px;
 }
 
 .side-new button {
-  padding: 3px 10px;
+  width: 100%;
+  padding: 4px 10px;
   font-size: 13px;
+}
+
+.side-token {
+  display: block;
+  width: calc(100% - 32px);
+  margin: 4px 16px;
+  padding: 4px 10px;
+  font-size: 13px;
+  color: var(--muted);
+  text-align: left;
 }
 
 .ns-row {
@@ -100,11 +113,15 @@ body {
 .ns-row a {
   flex: 1;
   min-width: 0;
+  /* 单行省略：名字再长也不会挤到删除按钮。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ns-del {
   visibility: hidden;
-  margin-right: 8px;
+  margin-right: 16px;
   padding: 0 7px;
   line-height: 18px;
   border-radius: 4px;
@@ -113,6 +130,13 @@ body {
 
 .ns-row:hover .ns-del {
   visibility: visible;
+}
+
+/* 触屏设备无 hover，删除按钮常显。 */
+@media (hover: none) {
+  .ns-del {
+    visibility: visible;
+  }
 }
 
 .ns-del:hover {
@@ -124,11 +148,104 @@ body {
   flex: 1;
   padding: 20px 28px;
   min-width: 0;
+  /* 整页骨架：列向布局，末尾的表格面板吃掉剩余高度。 */
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+/* 占满视口剩余高度的表格面板（flex-fill）：内部滚动。
+   列表页表格、集群成员表、详情 History 面板（可显隐）使用。 */
+.main > .flex-fill {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+.main > .flex-fill .table-wrap {
+  flex: 1;
+  min-height: 160px;
+}
+
+/* 详情页纵向分配：编辑区优先占 2 份，History 面板让步为 1 份，各自内部滚动。 */
+.main > .detail-body {
+  flex: 2 1 0;
+  min-height: 0;
+}
+
+/* 编辑框转列布局：textarea 撑满面板剩余高度，长配置不用手动拖拽输入框。 */
+.detail-body > .form {
+  flex: 1 1 480px;
+  max-width: none;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.detail-body > .form textarea {
+  flex: 1;
 }
 
 h2 {
   margin: 0 0 16px;
   font-size: 18px;
+}
+
+/* 详情页面包屑：Namespace 段可点击返回列表。 */
+.detail-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.detail-head h2 {
+  margin: 0;
+}
+
+/* 编辑框独占整行宽度（长配置需要更多空间）；点开历史快览时右侧分出约 2/5，
+   窗口不够宽时快览折行到编辑框下方。 */
+.detail-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: stretch;
+}
+
+.detail-body > .form {
+  flex: 1 1 480px;
+  max-width: none;
+}
+
+.detail-body > .detail-side {
+  flex: 0 1 40%;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 快览内容块随面板高度（与编辑框等高）伸缩，超高部分内部滚动。 */
+.detail-side pre.content {
+  flex: 1;
+  min-height: 220px;
+  max-height: 60vh;
+}
+
+.crumbs a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.crumbs a:hover {
+  text-decoration: underline;
+}
+
+.crumbs .crumb-sep {
+  color: var(--muted);
+  margin: 0 6px;
+  font-weight: 400;
 }
 
 .panel {
@@ -141,7 +258,62 @@ h2 {
 
 table {
   width: 100%;
-  border-collapse: collapse;
+  /* separate + 零间距与 collapse 视觉等价，但 sticky 表头的下边框不会随内容滚走。 */
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+/* 表格在 .main 剩余高度内滚动（由 flex 决定高度），窄窗口下横向滚动不撑破面板。 */
+.table-wrap {
+  overflow: auto;
+}
+
+.table-wrap thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+}
+
+/* 数据行 hover 高亮，配合行内链接提示可点击。 */
+.table-hover tbody tr:hover {
+  background: var(--bg);
+}
+
+/* 行首链接拉伸填满整个单元格：DataId 再短也有足够点击热区。 */
+td a.cell-link {
+  display: block;
+  margin: -7px -10px;
+  padding: 7px 10px;
+}
+
+/* 表格行内操作列：紧凑按钮不撑高行，按钮靠右。 */
+.btn-sm {
+  padding: 2px 10px;
+  font-size: 13px;
+}
+
+td.cell-actions {
+  text-align: right;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+/* History 勾选列：label 拉伸填满单元格，整格可点切换勾选。 */
+td.cell-select {
+  padding: 0;
+}
+
+td.cell-select label {
+  display: block;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+
+/* Version 列整格点击切换勾选；Tombstone 行不可选，光标保持默认。 */
+td.cell-version.clickable {
+  cursor: pointer;
+  user-select: none;
 }
 
 th,
@@ -157,6 +329,13 @@ th {
   font-weight: 500;
   font-size: 13px;
   white-space: nowrap;
+}
+
+/* 数字列右对齐 + 等宽数字，便于纵向比较。 */
+th.num,
+td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 td.mono,
@@ -269,6 +448,33 @@ label {
   padding: 8px 12px;
   margin: 10px 0;
   overflow-wrap: anywhere;
+}
+
+/* 写操作成功反馈：绿色，与错误通道在视觉上明确区分。 */
+.notice {
+  color: var(--ok);
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+}
+
+/* 表单容器：统一字段宽度上限，避免 input/textarea/标签行各一种宽度。 */
+.form {
+  max-width: 760px;
+}
+
+.form input,
+.form select {
+  width: 100%;
+}
+
+/* 标签键值行内两输入均分剩余宽度。 */
+.tag-row input {
+  flex: 1;
+  min-width: 0;
 }
 
 .hint {

@@ -10,9 +10,8 @@ export type Route =
 
 export const route = ref<Route>({ name: 'home' })
 
-export function goDetail(ns: string, dataId: string): void {
-  location.hash = `#/ns/${encodeURIComponent(ns)}/${encodeURIComponent(dataId)}`
-}
+// 页面导航统一用原生 href（#/...）：真实链接支持中键新开标签与复制，
+// 不经 JS 跳转函数。
 
 function parse(): Route {
   const parts = location.hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent)
