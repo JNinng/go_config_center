@@ -77,14 +77,21 @@ async function save(): Promise<void> {
   }
   saving.value = true
   try {
+    const saved = { content: content.value, data_type: dataType.value, tags: collectTags() }
     const res = await publish(props.ns, props.dataId, {
-      content: content.value,
-      data_type: dataType.value,
-      tags: collectTags(),
+      ...saved,
       expected_version: entry.value.version,
     })
     notice.value = `已发布 version=${res.version}`
+    // 读己之写（ADR-0003）：Follower 本机 GET 允许落后，若未追平本次写入，
+    // 以写响应 Version 校准 CAS 基线并恢复刚发布的内容，避免下一次发布撞旧版本冲突。
     await loadEntry()
+    if (entry.value && res.version > entry.value.version) {
+      entry.value = { ...entry.value, ...saved, version: res.version }
+      content.value = saved.content
+      dataType.value = saved.data_type
+      tagRows.value = Object.entries(saved.tags).map(([key, value]) => ({ key, value }))
+    }
     await loadHistory(true)
   } catch (e) {
     saveError.value = conflictMessage(e) ?? (e as Error).message
@@ -185,7 +192,23 @@ async function doRollback(toVersion: number): Promise<void> {
     notice.value = `已回滚，新版本 version=${res.version}`
     selected.value = []
     diffResult.value = null
+    // 读己之写（ADR-0003）：Follower 本机 GET 可能未追平；回滚即把 to_version
+    // 的 History 记录作为新版本发布（DESIGN §4.2），未追平时以该记录与写响应校准视图。
     await loadEntry()
+    if (entry.value && res.version > entry.value.version) {
+      const rec = history.value.find((r) => r.version === toVersion)
+      const tags = rec?.tags ?? {}
+      entry.value = {
+        ...entry.value,
+        data_type: rec?.data_type ?? entry.value.data_type,
+        content: rec?.content ?? entry.value.content,
+        tags,
+        version: res.version,
+      }
+      content.value = entry.value.content
+      dataType.value = entry.value.data_type
+      tagRows.value = Object.entries(tags).map(([key, value]) => ({ key, value }))
+    }
     await loadHistory(true)
   } catch (e) {
     if (e instanceof ApiError && e.code === 'invalid_rollback') {

@@ -62,16 +62,32 @@ async function create(): Promise<void> {
   }
   creating.value = true
   try {
-    await publish(props.ns, newDataId.value.trim(), {
+    const id = newDataId.value.trim()
+    const dataType = newDataType.value
+    const res = await publish(props.ns, id, {
       content: newContent.value,
-      data_type: newDataType.value,
+      data_type: dataType,
       expected_version: 0,
     })
     showCreate.value = false
     newDataId.value = ''
     newContent.value = ''
-    notice.value = '已创建'
+    notice.value = `已创建 version=${res.version}`
     await load(true)
+    // 读己之写（ADR-0003）：Follower 本机列表可能未追平，以写响应把新条目并入列表，
+    // 避免"创建成功却看不到"。
+    if (!entries.value.some((e) => e.data_id === id)) {
+      entries.value.push({
+        namespace: props.ns,
+        data_id: id,
+        data_type: dataType,
+        version: res.version,
+        tags: {},
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      entries.value.sort((a, b) => a.data_id.localeCompare(b.data_id))
+    }
   } catch (e) {
     if (e instanceof ApiError && e.code === 'version_conflict') {
       createError.value = `条目已存在（当前版本 ${e.currentVersion}）。更新请从条目详情页操作。`
