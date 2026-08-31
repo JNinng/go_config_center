@@ -268,13 +268,13 @@ func TestVersionsEndpoint(t *testing.T) {
 	st := mustStore(t)
 	ctx := context.Background()
 	withTags := raftlog.PublishData{Namespace: t.Name(), DataId: "a", DataType: "TEXT", Content: "v1", Tags: map[string]string{"team": "core"}}
-	if _, err := st.ApplyPublish(ctx, withTags, 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, withTags, time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: t.Name(), DataId: "a", DataType: "TEXT", Content: "v2"}, 2, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: t.Name(), DataId: "a", DataType: "TEXT", Content: "v2"}, time.Now(), 2, 1); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := st.ApplyDelete(ctx, raftlog.DeleteData{Namespace: t.Name(), DataId: "a", Actor: "admin"}, 3, 1); err != nil || res.Status != raftlog.StatusOK {
+	if res, err := st.ApplyDelete(ctx, raftlog.DeleteData{Namespace: t.Name(), DataId: "a", Actor: "admin"}, time.Now(), 3, 1); err != nil || res.Status != raftlog.StatusOK {
 		t.Fatalf("delete = %+v %v", res, err)
 	}
 
@@ -418,7 +418,7 @@ func TestWatchImmediateAndTimeout(t *testing.T) {
 	base := ts.URL + "/v1/namespaces/dev/configs/a/watch"
 
 	for i := 1; i <= 2; i++ {
-		if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: "a", DataType: "TEXT", Content: fmt.Sprintf("v%d", i)}, uint64(i), 1); err != nil {
+		if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: "a", DataType: "TEXT", Content: fmt.Sprintf("v%d", i)}, time.Now(), uint64(i), 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -437,7 +437,7 @@ func TestWatchImmediateAndTimeout(t *testing.T) {
 	}
 
 	// 条目此刻删除（墓碑 v3），供后续 deleted 断言使用。
-	if res, err := st.ApplyDelete(ctx, raftlog.DeleteData{Namespace: "dev", DataId: "a"}, 3, 1); err != nil || res.Status != raftlog.StatusOK {
+	if res, err := st.ApplyDelete(ctx, raftlog.DeleteData{Namespace: "dev", DataId: "a"}, time.Now(), 3, 1); err != nil || res.Status != raftlog.StatusOK {
 		t.Fatalf("delete = %+v %v", res, err)
 	}
 
@@ -489,7 +489,7 @@ func TestWatchWakeOnNotify(t *testing.T) {
 
 	// 等挂起连接完成快路径检查并注册，再模拟 FSM Apply 的唤醒。
 	time.Sleep(200 * time.Millisecond)
-	if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: "a", DataType: "TEXT", Content: "woken"}, 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: "a", DataType: "TEXT", Content: "woken"}, time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
 	hub.Notify("dev", "a", watch.Event{Version: 1})
@@ -914,14 +914,14 @@ func TestListConfigsAndNamespacesEndpoints(t *testing.T) {
 	st := mustStore(t)
 	ctx := context.Background()
 	for _, id := range []string{"b", "a", "c"} {
-		if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: id, DataType: "TEXT", Content: "body-of-" + id}, 0, 0); err != nil {
+		if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "dev", DataId: id, DataType: "TEXT", Content: "body-of-" + id}, time.Now(), 0, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "prod", DataId: "a", DataType: "TEXT", Content: "x"}, 0, 0); err != nil {
+	if _, err := st.ApplyPublish(ctx, raftlog.PublishData{Namespace: "prod", DataId: "a", DataType: "TEXT", Content: "x"}, time.Now(), 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := st.ApplyDelete(ctx, raftlog.DeleteData{Namespace: "dev", DataId: "b"}, 0, 0); err != nil || res.Status != raftlog.StatusOK {
+	if res, err := st.ApplyDelete(ctx, raftlog.DeleteData{Namespace: "dev", DataId: "b"}, time.Now(), 0, 0); err != nil || res.Status != raftlog.StatusOK {
 		t.Fatalf("delete = %+v %v", res, err)
 	}
 

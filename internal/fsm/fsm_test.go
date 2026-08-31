@@ -46,7 +46,7 @@ func publishLog(t *testing.T, index, term uint64, ns, dataID, content string, ex
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
+	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b, AppendedAt: time.Now()}
 }
 
 func deleteLog(t *testing.T, index, term uint64, ns, dataID string, expected *int64) *raft.Log {
@@ -61,7 +61,7 @@ func deleteLog(t *testing.T, index, term uint64, ns, dataID string, expected *in
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
+	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b, AppendedAt: time.Now()}
 }
 
 func rollbackLog(t *testing.T, index, term uint64, ns, dataID string, toVersion int64) *raft.Log {
@@ -76,7 +76,7 @@ func rollbackLog(t *testing.T, index, term uint64, ns, dataID string, toVersion 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
+	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b, AppendedAt: time.Now()}
 }
 
 func apply(t *testing.T, f *FSM, l *raft.Log) raftlog.Result {
@@ -403,7 +403,7 @@ func deleteNamespaceLog(t *testing.T, index, term uint64, ns string) *raft.Log {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b}
+	return &raft.Log{Index: index, Term: term, Type: raft.LogCommand, Data: b, AppendedAt: time.Now()}
 }
 
 // 验收：delete_namespace 单日志原子删除全部条目（各写 Tombstone）、结果携带

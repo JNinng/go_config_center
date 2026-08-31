@@ -15,6 +15,10 @@ import (
 // Store 是存储后端契约。实现约束：
 //   - Apply 三方法必须在单个事务内完成业务写入与进度推进（无进度空洞）；
 //     写入失败返回错误并回滚（上层按 apply-or-die 契约崩溃重放）。
+//   - Apply 方法的 ts 参数是日志的业务时间戳（Raft 日志 AppendedAt：Leader 追加时
+//     盖章，随日志复制与持久化，各节点应用同一条日志得到同一值）。行级
+//     created_at/updated_at 一律取 ts，禁止以本机时钟或数据库默认值盖章——
+//     否则节点加入/追平时时间字段与 Leader 漂移（DESIGN §3.1）。
 //   - ExportTables/ImportTables 的数据体字节由实现自定义编码，但分节顺序
 //     与命名须遵守 SnapshotTables（快照格式 v1 契约）。
 type Store interface {
@@ -49,21 +53,21 @@ type Store interface {
 
 	// ApplyPublish 应用 op=publish：CAS 判定 → upsert 当前条目 + 追加 History +
 	// 推进步度。CAS 失败等拒绝结果也是已提交日志，须推进进度。
-	ApplyPublish(ctx context.Context, d raftlog.PublishData, index, term uint64) (raftlog.Result, error)
+	ApplyPublish(ctx context.Context, d raftlog.PublishData, ts time.Time, index, term uint64) (raftlog.Result, error)
 
 	// ApplyDelete 应用 op=delete：删除当前条目 + 追加 content 为 NULL 的 Tombstone
 	//（版本号照常消耗）+ 推进步度。条目不存在或 CAS 不匹配为拒绝结果。
-	ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, term uint64) (raftlog.Result, error)
+	ApplyDelete(ctx context.Context, d raftlog.DeleteData, ts time.Time, index, term uint64) (raftlog.Result, error)
 
 	// ApplyDeleteNamespace 应用 op=delete_namespace：单事务删除该 Namespace 下全部
 	// 存活条目，各追加一条 Tombstone（版本序列照常延续）+ 推进步度。
 	// 无存活条目时为空操作（Entries=0，幂等）；结果携带被删条目清单（供 Watch 唤醒）。
-	ApplyDeleteNamespace(ctx context.Context, d raftlog.DeleteNamespaceData, index, term uint64) (raftlog.Result, error)
+	ApplyDeleteNamespace(ctx context.Context, d raftlog.DeleteNamespaceData, ts time.Time, index, term uint64) (raftlog.Result, error)
 
 	// ApplyRollback 应用 op=rollback：以 to_version 从 History 取内容发布为新版本，
 	// 从不物理撤销；目标解析与发布同事务（无 TOCTOU）。
 	// 无效目标（History 不存在 / 指向 Tombstone / ≥ 当前版本）为拒绝结果。
-	ApplyRollback(ctx context.Context, d raftlog.RollbackData, index, term uint64) (raftlog.Result, error)
+	ApplyRollback(ctx context.Context, d raftlog.RollbackData, ts time.Time, index, term uint64) (raftlog.Result, error)
 
 	// ExportTables 在单个一致性读事务内导出全部数据体：分节按 SnapshotTables 顺序
 	// 连续写入 w，返回该事务读到的 FSM 进度（即快照点）与各分节行数/字节长度。

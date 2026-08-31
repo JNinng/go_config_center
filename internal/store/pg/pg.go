@@ -201,7 +201,9 @@ func (s *Store) GetEntry(ctx context.Context, namespace, dataId string) (*store.
 // ApplyPublish 在单个 PG 事务内完成 op=publish：
 // 读当前版本 → CAS 判定 → upsert biz_configs + 追加 History + 推进 raft_fsm_meta。
 // 无论业务结果如何，raft_fsm_meta 都与业务表同事务推进——CAS 失败也是已提交日志。
-func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, index, term uint64) (raftlog.Result, error) {
+// ts 为日志业务时间戳（Raft AppendedAt，Leader 盖章）：行级时间一律取它，
+// 禁止 now()——各节点物化时间必须一致（DESIGN §3.1）。
+func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, ts time.Time, index, term uint64) (raftlog.Result, error) {
 	tctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
@@ -256,22 +258,22 @@ func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, index, 
 	}
 
 	if _, err = tx.Exec(tctx, `
-		INSERT INTO biz_configs (namespace, data_id, data_type, content, version, tags)
-		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+		INSERT INTO biz_configs (namespace, data_id, data_type, content, version, tags, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $7)
 		ON CONFLICT (namespace, data_id) DO UPDATE SET
 			data_type  = EXCLUDED.data_type,
 			content    = EXCLUDED.content,
 			version    = EXCLUDED.version,
 			tags       = EXCLUDED.tags,
-			updated_at = now()`,
-		d.Namespace, d.DataId, d.DataType, d.Content, version, tags); err != nil {
+			updated_at = $7`,
+		d.Namespace, d.DataId, d.DataType, d.Content, version, tags, ts); err != nil {
 		return raftlog.Result{}, fmt.Errorf("upsert biz_configs: %w", err)
 	}
 
 	if _, err = tx.Exec(tctx, `
-		INSERT INTO biz_config_history (namespace, data_id, version, op, data_type, content, tags, actor)
-		VALUES ($1, $2, $3, 'publish', $4, $5, $6::jsonb, $7)`,
-		d.Namespace, d.DataId, version, d.DataType, d.Content, tags, d.Actor); err != nil {
+		INSERT INTO biz_config_history (namespace, data_id, version, op, data_type, content, tags, actor, created_at)
+		VALUES ($1, $2, $3, 'publish', $4, $5, $6::jsonb, $7, $8)`,
+		d.Namespace, d.DataId, version, d.DataType, d.Content, tags, d.Actor, ts); err != nil {
 		return raftlog.Result{}, fmt.Errorf("追加 History: %w", err)
 	}
 
@@ -289,7 +291,7 @@ func (s *Store) ApplyPublish(ctx context.Context, d raftlog.PublishData, index, 
 // 追加 content 为 NULL 的 Tombstone（ADR-0010，版本号照常消耗）+ 推进 raft_fsm_meta。
 // 条目不存在或已删除返回 not_found（无物可删）；CAS 不匹配返回 conflict——
 // 二者都是已提交日志，进度同事务推进，不追加 History。
-func (s *Store) ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, term uint64) (raftlog.Result, error) {
+func (s *Store) ApplyDelete(ctx context.Context, d raftlog.DeleteData, ts time.Time, index, term uint64) (raftlog.Result, error) {
 	tctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
@@ -324,9 +326,9 @@ func (s *Store) ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, te
 		return raftlog.Result{}, fmt.Errorf("删除 biz_configs: %w", err)
 	}
 	if _, err = tx.Exec(tctx, `
-		INSERT INTO biz_config_history (namespace, data_id, version, op, actor)
-		VALUES ($1, $2, $3, 'delete', $4)`,
-		d.Namespace, d.DataId, current+1, d.Actor); err != nil {
+		INSERT INTO biz_config_history (namespace, data_id, version, op, actor, created_at)
+		VALUES ($1, $2, $3, 'delete', $4, $5)`,
+		d.Namespace, d.DataId, current+1, d.Actor, ts); err != nil {
 		return raftlog.Result{}, fmt.Errorf("追加 Tombstone: %w", err)
 	}
 
@@ -345,7 +347,7 @@ func (s *Store) ApplyDelete(ctx context.Context, d raftlog.DeleteData, index, te
 // 目标解析与发布同事务，消除与并发写的竞态（无 TOCTOU）。
 // 无效目标：History 中不存在 → not_found；指向 Tombstone 或 ≥ 当前版本 → invalid_rollback。
 // 二者都是已提交日志：不追加 History，进度同事务推进。
-func (s *Store) ApplyRollback(ctx context.Context, d raftlog.RollbackData, index, term uint64) (raftlog.Result, error) {
+func (s *Store) ApplyRollback(ctx context.Context, d raftlog.RollbackData, ts time.Time, index, term uint64) (raftlog.Result, error) {
 	tctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
@@ -407,21 +409,21 @@ func (s *Store) ApplyRollback(ctx context.Context, d raftlog.RollbackData, index
 		tagsPtr = &s
 	}
 	if _, err = tx.Exec(tctx, `
-		INSERT INTO biz_configs (namespace, data_id, data_type, content, version, tags)
-		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+		INSERT INTO biz_configs (namespace, data_id, data_type, content, version, tags, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $7)
 		ON CONFLICT (namespace, data_id) DO UPDATE SET
 			data_type  = EXCLUDED.data_type,
 			content    = EXCLUDED.content,
 			version    = EXCLUDED.version,
 			tags       = EXCLUDED.tags,
-			updated_at = now()`,
-		d.Namespace, d.DataId, *dataType, *content, version, tagsPtr); err != nil {
+			updated_at = $7`,
+		d.Namespace, d.DataId, *dataType, *content, version, tagsPtr, ts); err != nil {
 		return raftlog.Result{}, fmt.Errorf("upsert biz_configs: %w", err)
 	}
 	if _, err = tx.Exec(tctx, `
-		INSERT INTO biz_config_history (namespace, data_id, version, op, data_type, content, tags, actor)
-		VALUES ($1, $2, $3, 'publish', $4, $5, $6::jsonb, $7)`,
-		d.Namespace, d.DataId, version, *dataType, *content, tagsPtr, d.Actor); err != nil {
+		INSERT INTO biz_config_history (namespace, data_id, version, op, data_type, content, tags, actor, created_at)
+		VALUES ($1, $2, $3, 'publish', $4, $5, $6::jsonb, $7, $8)`,
+		d.Namespace, d.DataId, version, *dataType, *content, tagsPtr, d.Actor, ts); err != nil {
 		return raftlog.Result{}, fmt.Errorf("追加 History: %w", err)
 	}
 
@@ -562,7 +564,7 @@ func (s *Store) ListNamespaces(ctx context.Context) ([]string, error) {
 // 单条 CTE 原子完成：DELETE ... RETURNING 取回 (data_id, version)，随即逐行
 // INSERT Tombstone——结果携带被删条目清单与墓碑版本，供 FSM 唤醒 Watch。
 // 无存活条目为空操作（Entries=0，幂等）。
-func (s *Store) ApplyDeleteNamespace(ctx context.Context, d raftlog.DeleteNamespaceData, index, term uint64) (raftlog.Result, error) {
+func (s *Store) ApplyDeleteNamespace(ctx context.Context, d raftlog.DeleteNamespaceData, ts time.Time, index, term uint64) (raftlog.Result, error) {
 	tctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
@@ -578,9 +580,9 @@ func (s *Store) ApplyDeleteNamespace(ctx context.Context, d raftlog.DeleteNamesp
 			DELETE FROM biz_configs WHERE namespace = $1
 			RETURNING data_id, version
 		)
-		INSERT INTO biz_config_history (namespace, data_id, version, op, actor)
-		SELECT $1, data_id, version + 1, 'delete', $2 FROM deleted
-		RETURNING data_id, version`, d.Namespace, d.Actor)
+		INSERT INTO biz_config_history (namespace, data_id, version, op, actor, created_at)
+		SELECT $1, data_id, version + 1, 'delete', $2, $3 FROM deleted
+		RETURNING data_id, version`, d.Namespace, d.Actor, ts)
 	if err != nil {
 		return raftlog.Result{}, fmt.Errorf("删除 Namespace: %w", err)
 	}

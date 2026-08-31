@@ -92,6 +92,7 @@ CREATE TABLE raft_fsm_meta (
 - `biz_configs.version` 恒等于该条目 History 中的最大 version。
 - 版本号按 `(namespace, data_id)` 单调分配，Publish 与 Delete 均消耗版本号；删除后重建延续同一序列。
 - History 只追加，永不 UPDATE/DELETE。
+- 行级 `created_at/updated_at` 一律取日志的业务时间戳（hashicorp/raft `Log.AppendedAt`：Leader 追加日志时盖章，随日志复制与持久化，各节点应用同一条日志得到同一值），写路径显式赋值，禁止以本机时钟或数据库 `now()` 盖章——否则节点加入/追平时物化时间与 Leader 漂移。
 - `raft_fsm_meta` 与业务表同事务更新，二者进度恒一致——这是 §4.4 跳过式恢复（本机进度不落后于快照点时跳过数据导入）的依据。
 
 ### 3.2 Raft 日志格式

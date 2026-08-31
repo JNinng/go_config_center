@@ -5,6 +5,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
@@ -67,6 +68,30 @@ func TestTicket15(t *testing.T) {
 	}), "新写入复制到重连节点")
 	time.Sleep(5 * time.Second) // 越过 2s 护栏周期：加入中节点不得被 42 误杀
 	check(t, n2.alive(), "重连节点持续存活（护栏未误杀）")
+
+	section("时间字段一致性：重连节点与 Leader 的 created_at/updated_at 同值（DESIGN §3.1）")
+	// 业务时间戳取 Raft 日志 AppendedAt（Leader 盖章随日志分发）——读路径返回的是
+	// 各节点本地 PG 的物化值，跨节点必须相同，与该节点何时应用日志无关。
+	entryTimes := func(port int, ns, id string) (createdAt, updatedAt string) {
+		r := req(clientDirect, "GET", port, fmt.Sprintf("/v1/namespaces/%s/configs/%s", ns, id), nil, 5*time.Second, false)
+		var e struct {
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
+		}
+		_ = json.Unmarshal(r.Body, &e)
+		return e.CreatedAt, e.UpdatedAt
+	}
+	sameInstant := func(a, b string) bool {
+		ta, err1 := time.Parse(time.RFC3339Nano, a)
+		tb, err2 := time.Parse(time.RFC3339Nano, b)
+		return err1 == nil && err2 == nil && ta.Equal(tb)
+	}
+	for _, id := range []string{"before.remove", "rejoin.check"} {
+		ca0, ua0 := entryTimes(8080, "dev", id)
+		ca1, ua1 := entryTimes(8081, "dev", id)
+		check(t, ca0 != "" && sameInstant(ca0, ca1), "%s created_at 跨节点一致（%q vs %q）", id, ca0, ca1)
+		check(t, ua0 != "" && sameInstant(ua0, ua1), "%s updated_at 跨节点一致（%q vs %q）", id, ua0, ua1)
+	}
 
 	section("场景 B：kill -9（未收到移除日志）后被移除，原 data_dir 重启自愈")
 	n3.kill()

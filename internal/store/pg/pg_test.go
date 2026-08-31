@@ -46,7 +46,7 @@ func TestApplyPublishFirstVersionIsOne(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
 
-	res, err := st.ApplyPublish(ctx, pub(t.Name(), "db.password", "s3cret", nil), 1, 1)
+	res, err := st.ApplyPublish(ctx, pub(t.Name(), "db.password", "s3cret", nil), time.Now(), 1, 1)
 	if err != nil {
 		t.Fatalf("ApplyPublish: %v", err)
 	}
@@ -66,10 +66,10 @@ func TestApplyPublishFirstVersionIsOne(t *testing.T) {
 func TestApplyPublishSecondVersionIncrements(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	res, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "2", nil), 2, 1)
+	res, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "2", nil), time.Now(), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,11 +87,11 @@ func TestApplyPublishCASConflictStillAdvancesMeta(t *testing.T) {
 	st, dsn := mustOpen(t)
 	ctx := context.Background()
 	wrong := int64(99)
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "2", &wrong), 2, 1)
+	res, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "2", &wrong), time.Now(), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,17 +119,17 @@ func TestApplyPublishCASCases(t *testing.T) {
 	one := int64(1)
 
 	// expected=0 在不存在的条目上通过（create-if-absent，DESIGN §4.1）
-	res, _ := st.ApplyPublish(ctx, pub(t.Name(), "new", "x", &zero), 1, 1)
+	res, _ := st.ApplyPublish(ctx, pub(t.Name(), "new", "x", &zero), time.Now(), 1, 1)
 	if res.Status != raftlog.StatusOK || res.Version != 1 {
 		t.Fatalf("expected=0 create: %+v", res)
 	}
 	// expected=0 在已存在条目上冲突
-	res, _ = st.ApplyPublish(ctx, pub(t.Name(), "new", "y", &zero), 2, 1)
+	res, _ = st.ApplyPublish(ctx, pub(t.Name(), "new", "y", &zero), time.Now(), 2, 1)
 	if res.Status != raftlog.StatusVersionConflict || res.CurrentVersion != 1 {
 		t.Fatalf("expected=0 on existing: %+v", res)
 	}
 	// expected=1 匹配当前版本，通过
-	res, _ = st.ApplyPublish(ctx, pub(t.Name(), "new", "z", &one), 3, 1)
+	res, _ = st.ApplyPublish(ctx, pub(t.Name(), "new", "z", &one), time.Now(), 3, 1)
 	if res.Status != raftlog.StatusOK || res.Version != 2 {
 		t.Fatalf("expected=1 match: %+v", res)
 	}
@@ -149,7 +149,7 @@ func TestApplyPublishCASAfterTombstone(t *testing.T) {
 	}
 
 	zero := int64(0)
-	res, err := st.ApplyPublish(ctx, pub(ns, "a", "reborn", &zero), 1, 1)
+	res, err := st.ApplyPublish(ctx, pub(ns, "a", "reborn", &zero), time.Now(), 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestApplyPublishCASAfterTombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 	five := int64(5)
-	res, err = st.ApplyPublish(ctx, pub(ns, "a", "reborn2", &five), 2, 1)
+	res, err = st.ApplyPublish(ctx, pub(ns, "a", "reborn2", &five), time.Now(), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestApplyPublishCASAfterTombstone(t *testing.T) {
 
 	// expected 指向重建前的旧版本 → 冲突，current 为当前存活版本。
 	four := int64(4)
-	res, _ = st.ApplyPublish(ctx, pub(ns, "a", "stale", &four), 3, 1)
+	res, _ = st.ApplyPublish(ctx, pub(ns, "a", "stale", &four), time.Now(), 3, 1)
 	if res.Status != raftlog.StatusVersionConflict || res.CurrentVersion != 6 {
 		t.Fatalf("过期 expected 应冲突: %+v, want conflict current=6", res)
 	}
@@ -188,7 +188,7 @@ func TestApplyPublishCASAfterTombstone(t *testing.T) {
 func TestStateSurvivesStoreReopen(t *testing.T) {
 	st, dsn := mustOpen(t)
 	ctx := context.Background()
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "1", nil), 7, 2); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "1", nil), time.Now(), 7, 2); err != nil {
 		t.Fatal(err)
 	}
 	st.Close()
@@ -227,11 +227,11 @@ func TestGetEntryMissingReturnsNil(t *testing.T) {
 func TestApplyDeleteWritesTombstone(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 2, 1)
+	res, err := st.ApplyDelete(ctx, del(t.Name(), "a", nil), time.Now(), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestApplyDeleteMissingReturnsNotFound(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
 
-	res, err := st.ApplyDelete(ctx, del(t.Name(), "ghost", nil), 1, 1)
+	res, err := st.ApplyDelete(ctx, del(t.Name(), "ghost", nil), time.Now(), 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,12 +278,12 @@ func TestApplyDeleteMissingReturnsNotFound(t *testing.T) {
 func TestApplyDeleteCASMismatch(t *testing.T) {
 	st, dsn := mustOpen(t)
 	ctx := context.Background()
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
 
 	zero := int64(0)
-	res, err := st.ApplyDelete(ctx, del(t.Name(), "a", &zero), 2, 1)
+	res, err := st.ApplyDelete(ctx, del(t.Name(), "a", &zero), time.Now(), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +292,7 @@ func TestApplyDeleteCASMismatch(t *testing.T) {
 	}
 
 	wrong := int64(99)
-	res, err = st.ApplyDelete(ctx, del(t.Name(), "a", &wrong), 3, 1)
+	res, err = st.ApplyDelete(ctx, del(t.Name(), "a", &wrong), time.Now(), 3, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,13 +313,13 @@ func TestApplyDeleteCASMismatch(t *testing.T) {
 func TestRepublishAfterDeleteContinuesVersion(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 2, 1); res.Status != raftlog.StatusOK {
+	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), time.Now(), 2, 1); res.Status != raftlog.StatusOK {
 		t.Fatalf("delete: %+v", res)
 	}
-	res, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "reborn", nil), 3, 1)
+	res, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "reborn", nil), time.Now(), 3, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,13 +334,13 @@ func TestListHistory(t *testing.T) {
 	ctx := context.Background()
 	withTags := pub(t.Name(), "a", "v1", nil)
 	withTags.Tags = map[string]string{"team": "core"}
-	if _, err := st.ApplyPublish(ctx, withTags, 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, withTags, time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), 2, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), time.Now(), 2, 1); err != nil {
 		t.Fatal(err)
 	}
-	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 3, 1); res.Status != raftlog.StatusOK {
+	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), time.Now(), 3, 1); res.Status != raftlog.StatusOK {
 		t.Fatalf("delete: %+v", res)
 	}
 
@@ -380,14 +380,14 @@ func TestApplyRollbackPublishesOldContentAsNewVersion(t *testing.T) {
 	ctx := context.Background()
 	v1 := pub(t.Name(), "a", "v1-content", nil)
 	v1.Tags = map[string]string{"team": "core"}
-	if _, err := st.ApplyPublish(ctx, v1, 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, v1, time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2-content", nil), 2, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2-content", nil), time.Now(), 2, 1); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), 3, 1)
+	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), time.Now(), 3, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,31 +414,31 @@ func TestApplyRollbackPublishesOldContentAsNewVersion(t *testing.T) {
 func TestApplyRollbackInvalidTargets(t *testing.T) {
 	st, dsn := mustOpen(t)
 	ctx := context.Background()
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), 2, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), time.Now(), 2, 1); err != nil {
 		t.Fatal(err)
 	}
-	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 3, 1); res.Status != raftlog.StatusOK {
+	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), time.Now(), 3, 1); res.Status != raftlog.StatusOK {
 		t.Fatalf("delete: %+v", res)
 	}
 
-	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 99), 4, 1)
+	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 99), time.Now(), 4, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Status != raftlog.StatusNotFound {
 		t.Fatalf("to_version=99 = %+v, want not_found", res)
 	}
-	res, err = st.ApplyRollback(ctx, rb(t.Name(), "a", 3), 5, 1)
+	res, err = st.ApplyRollback(ctx, rb(t.Name(), "a", 3), time.Now(), 5, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Status != raftlog.StatusInvalidRollback || res.CurrentVersion != 3 {
 		t.Fatalf("to_version=3（墓碑）= %+v, want invalid_rollback current=3", res)
 	}
-	res, err = st.ApplyRollback(ctx, rb(t.Name(), "ghost", 1), 6, 1)
+	res, err = st.ApplyRollback(ctx, rb(t.Name(), "ghost", 1), time.Now(), 6, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,16 +458,16 @@ func TestApplyRollbackInvalidTargets(t *testing.T) {
 func TestApplyRollbackChainAndRebuild(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), 2, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v2", nil), time.Now(), 2, 1); err != nil {
 		t.Fatal(err)
 	}
-	if res, _ := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), 3, 1); res.Version != 3 {
+	if res, _ := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), time.Now(), 3, 1); res.Version != 3 {
 		t.Fatalf("rollback to 1: %+v", res)
 	}
-	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 2), 4, 1)
+	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 2), time.Now(), 4, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,10 +479,10 @@ func TestApplyRollbackChainAndRebuild(t *testing.T) {
 	}
 
 	// 删除后回滚：current 为墓碑版本 5，回滚到 v4 重建为 v6。
-	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), 5, 1); res.Status != raftlog.StatusOK {
+	if res, _ := st.ApplyDelete(ctx, del(t.Name(), "a", nil), time.Now(), 5, 1); res.Status != raftlog.StatusOK {
 		t.Fatalf("delete: %+v", res)
 	}
-	res, err = st.ApplyRollback(ctx, rb(t.Name(), "a", 4), 6, 1)
+	res, err = st.ApplyRollback(ctx, rb(t.Name(), "a", 4), time.Now(), 6, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,10 +495,10 @@ func TestApplyRollbackChainAndRebuild(t *testing.T) {
 func TestApplyRollbackToCurrentVersionRejected(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
-	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(t.Name(), "a", "v1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), 2, 1)
+	res, err := st.ApplyRollback(ctx, rb(t.Name(), "a", 1), time.Now(), 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,11 +521,11 @@ func TestListEntriesKeysetPagination(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
 	for _, id := range []string{"b", "a", "c"} {
-		if _, err := st.ApplyPublish(ctx, pub(t.Name(), id, "content-of-"+id, nil), 0, 0); err != nil {
+		if _, err := st.ApplyPublish(ctx, pub(t.Name(), id, "content-of-"+id, nil), time.Now(), 0, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if res, err := st.ApplyDelete(ctx, del(t.Name(), "b", nil), 0, 0); err != nil || res.Status != raftlog.StatusOK {
+	if res, err := st.ApplyDelete(ctx, del(t.Name(), "b", nil), time.Now(), 0, 0); err != nil || res.Status != raftlog.StatusOK {
 		t.Fatalf("delete b = %+v %v", res, err)
 	}
 
@@ -570,7 +570,7 @@ func TestListNamespacesDistinctOrdered(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()
 	for _, ns := range []string{"prod", "dev", "dev"} {
-		if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v1", nil), 0, 0); err != nil {
+		if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v1", nil), time.Now(), 0, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -582,7 +582,7 @@ func TestListNamespacesDistinctOrdered(t *testing.T) {
 		t.Fatalf("namespaces = %v, want [dev prod]", got)
 	}
 
-	if _, err := st.ApplyDelete(ctx, del("dev", "a", nil), 0, 0); err != nil {
+	if _, err := st.ApplyDelete(ctx, del("dev", "a", nil), time.Now(), 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	got, err = st.ListNamespaces(ctx)
@@ -641,17 +641,17 @@ func TestApplyDeleteNamespace(t *testing.T) {
 	st, dsn := mustOpen(t)
 	ctx := context.Background()
 	ns := t.Name()
-	if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v1", nil), 1, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v1", nil), time.Now(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v2", nil), 2, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(ns, "a", "v2", nil), time.Now(), 2, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyPublish(ctx, pub(ns, "b", "x", nil), 3, 1); err != nil {
+	if _, err := st.ApplyPublish(ctx, pub(ns, "b", "x", nil), time.Now(), 3, 1); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := st.ApplyDeleteNamespace(ctx, raftlog.DeleteNamespaceData{Namespace: ns, Actor: "admin"}, 4, 1)
+	res, err := st.ApplyDeleteNamespace(ctx, raftlog.DeleteNamespaceData{Namespace: ns, Actor: "admin"}, time.Now(), 4, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,13 +681,13 @@ func TestApplyDeleteNamespace(t *testing.T) {
 	}
 
 	// 幂等：再次删除空 Namespace。
-	res, err = st.ApplyDeleteNamespace(ctx, raftlog.DeleteNamespaceData{Namespace: ns}, 5, 1)
+	res, err = st.ApplyDeleteNamespace(ctx, raftlog.DeleteNamespaceData{Namespace: ns}, time.Now(), 5, 1)
 	if err != nil || res.Status != raftlog.StatusOK || res.Entries != 0 {
 		t.Fatalf("重复删除 = %+v %v, want ok entries=0", res, err)
 	}
 
 	// 可回滚：对 a 回滚到墓碑之前的 v1，条目重建。
-	res, err = st.ApplyRollback(ctx, rb(ns, "a", 1), 6, 1)
+	res, err = st.ApplyRollback(ctx, rb(ns, "a", 1), time.Now(), 6, 1)
 	if err != nil || res.Status != raftlog.StatusOK || !res.Created {
 		t.Fatalf("删除后回滚重建 = %+v %v, want ok created v4", res, err)
 	}

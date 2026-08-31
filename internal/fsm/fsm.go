@@ -126,6 +126,9 @@ func (f *FSM) Apply(l *raft.Log) interface{} {
 	return res
 }
 
+// applyCommitted 解码并执行一条 LogCommand。业务时间戳取 l.AppendedAt——Leader 追加
+// 日志时盖章、随日志复制与持久化，各节点应用同一条日志得到同一值，物化时间跨节点
+// 一致（DESIGN §3.1）。
 func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 	cmd, err := raftlog.Decode(l.Data)
 	if err != nil {
@@ -138,7 +141,7 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		if err != nil {
 			return f.advanceOnly(l, err, "publish 载荷非法，仅推进进度"), raftlog.OpPublish
 		}
-		res, err := f.store.ApplyPublish(context.Background(), data, l.Index, l.Term)
+		res, err := f.store.ApplyPublish(context.Background(), data, l.AppendedAt, l.Index, l.Term)
 		if err != nil {
 			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
 		}
@@ -153,7 +156,7 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		if err != nil {
 			return f.advanceOnly(l, err, "delete 载荷非法，仅推进进度"), raftlog.OpDelete
 		}
-		res, err := f.store.ApplyDelete(context.Background(), data, l.Index, l.Term)
+		res, err := f.store.ApplyDelete(context.Background(), data, l.AppendedAt, l.Index, l.Term)
 		if err != nil {
 			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
 		}
@@ -168,7 +171,7 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		if err != nil {
 			return f.advanceOnly(l, err, "rollback 载荷非法，仅推进进度"), raftlog.OpRollback
 		}
-		res, err := f.store.ApplyRollback(context.Background(), data, l.Index, l.Term)
+		res, err := f.store.ApplyRollback(context.Background(), data, l.AppendedAt, l.Index, l.Term)
 		if err != nil {
 			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
 		}
@@ -183,7 +186,7 @@ func (f *FSM) applyCommitted(l *raft.Log) (raftlog.Result, raftlog.Op) {
 		if err != nil {
 			return f.advanceOnly(l, err, "delete_namespace 载荷非法，仅推进进度"), raftlog.OpDeleteNamespace
 		}
-		res, err := f.store.ApplyDeleteNamespace(context.Background(), data, l.Index, l.Term)
+		res, err := f.store.ApplyDeleteNamespace(context.Background(), data, l.AppendedAt, l.Index, l.Term)
 		if err != nil {
 			panic(fmt.Sprintf("FSM Apply index=%d 写入 PG 失败: %v", l.Index, err))
 		}

@@ -26,6 +26,7 @@ bash scripts/build-console.sh   # 控制台：前端构建（需 node）+ go bui
 - Apply/Snapshot/Restore 由 Raft 单 goroutine 串行调度，FSM Apply 路径不加锁（互斥锁仅保护结果表并发读）。
 - **Rollback 的 to_version 在 FSM Apply 阶段解析**，API 层不预取（避免 TOCTOU）。
 - History 只追加；Delete 写 Tombstone 并消耗版本号；版本按 `(namespace, data_id)` 单调。
+- **行级时间戳随日志（DESIGN §3.1）**：`created_at/updated_at` 取 Raft 日志 `AppendedAt`（Leader 盖章随日志分发），存储写路径显式赋值——禁止本机时钟或 `now()` 盖章，否则新节点追平时时间与 Leader 漂移。
 - 写路径只能经 Raft 提案；读路径读本机 PG（允许陈旧，无 ReadIndex，见 ADR-0003）。
 - **lineage 护栏（DESIGN §6.2）**：本节点 PG 进度不得越过本地 Raft 日志末端，main.go 启动时校验，越界即拒绝启动（继续运行会静默吞写）；`pg_dsn` 指向的库不存在时由 `pg.Open` 自动创建。
 

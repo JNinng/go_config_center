@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"time"
 	"testing"
 
 	"github.com/hashicorp/raft"
@@ -90,7 +91,7 @@ func genLogs(t *testing.T, seed int64, count int) []logSpec {
 func toRaftLogs(specs []logSpec) []*raft.Log {
 	logs := make([]*raft.Log, len(specs))
 	for i, s := range specs {
-		logs[i] = &raft.Log{Index: s.index, Term: s.term, Type: raft.LogCommand, Data: s.data}
+		logs[i] = &raft.Log{Index: s.index, Term: s.term, Type: raft.LogCommand, Data: s.data, AppendedAt: time.Now()}
 	}
 	return logs
 }
