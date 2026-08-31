@@ -51,7 +51,7 @@ func TestRunJoinsThroughLeaderSeed(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, quietLogger(), opts, false)
+	go Run(ctx, quietLogger(), opts)
 
 	select {
 	case addr := <-onLeader:
@@ -106,7 +106,7 @@ func TestRunJoinsViaFollowerCache(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, quietLogger(), opts, false)
+	go Run(ctx, quietLogger(), opts)
 
 	select {
 	case addr := <-onLeader:
@@ -127,7 +127,7 @@ func TestRunKeepsRetryingWhenSeedsUnreachable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	returned := make(chan struct{})
 	go func() {
-		Run(ctx, quietLogger(), opts, false)
+		Run(ctx, quietLogger(), opts)
 		close(returned)
 	}()
 	select {

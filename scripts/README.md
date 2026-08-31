@@ -60,6 +60,9 @@ go test -tags e2e ./scripts -run TestTicket -v -count=1     # 全部票按序执
 | `TestTicket10` | 混沌场景（DESIGN §8.2 前两项） | 杀 Leader 秒级切主、已提交写不丢；挂起进程模拟分区，恢复后自动追平 |
 | `TestTicket11` | 快照保留清理 + InstallSnapshot | 小阈值（threshold=20/interval=2s/retention=2）放大压缩行为；挂起 Follower 制造落后，恢复后经 InstallSnapshot 追平 |
 | `TestTicket12` | 10 万条规模化验证 | 两节点、20 并发写 10 万条；快照时长/体积记录；冷重启 ≤10s；新节点 InstallSnapshot 追平。**最耗时的一张**（10 万次 HTTP 写入，分钟级） |
+| `TestTicket13` | 控制台与条目列表端点 | 对占位页与已构建两种二进制均成立：根路径、SPA fallback、API 不被遮蔽、CORS、Namespace/条目列表分页 |
+| `TestTicket14` | Namespace 管理 | 隐式创建；`DELETE /v1/namespaces/{ns}` 原子删除全部存活条目并各写 Tombstone，幂等 |
+| `TestTicket15` | 被移除节点带既有数据目录重连 | 原样重启（不清库、同 Node ID）重新加入并追平：42 退出后再入、kill -9 未收到移除日志再入；加入中节点不被 42 误杀 |
 
 票 06（FSM 幂等性属性测试）没有 e2e 测试，对应单元测试：
 

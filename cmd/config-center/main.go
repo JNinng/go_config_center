@@ -134,9 +134,10 @@ func main() {
 			fatal(logger, "--bootstrap 拒绝执行", fmt.Errorf("PG raft_fsm_meta.last_applied_index=%d > 0，要求空库；灾难恢复须选数据最新的节点清零 raft_fsm_meta 后再 --bootstrap 重建集群", idx))
 		}
 	}
-	// 非 bootstrap 节点不因无集群态而退出：由发现代理经 Seed List 加入（ADR-0008，
-	// 永不自举）；已有状态的节点重启后仍是成员（成员表随 Raft 日志持久化），
-	// 发现代理跳过 Join、仅跟踪 Leader 地址。
+	// 非 bootstrap 节点一律经发现代理 Join（DESIGN §4.5，接口幂等）：空状态节点加入
+	// 集群；带状态节点重启属重连——已在成员表时 Join 是 200 空操作，曾被移除时
+	// （本地 Raft 日志未及收到移除日志，或收到后进程退出）重新 Join 是唯一自愈路径。
+	// 本地有 Raft 状态只说明有持久化数据，不说明仍在成员表，故不可跳过 Join。
 
 	r, err := raft.NewRaft(raftCfg, machine, boltStore, boltStore, snapStore, transport)
 	if err != nil {
@@ -448,7 +449,7 @@ func main() {
 				leaderHTTPCache.Store(httpAddr)
 				cachedForLeader.Store(raftAddr)
 			},
-		}, hasState)
+		})
 	}
 
 	snapshotTrigger := func() (uint64, error) {
@@ -496,8 +497,11 @@ func main() {
 	// 仅在本节点作为 Leader、提交的成员表已不含自身时触发库内关闭，即移除 Leader
 	// 自身的场景；移除 Follower 时库不会关闭它（收不到任何 Raft 消息，投票请求也会被
 	// 成员节点拒绝）；② 非 Leader 节点向发现代理缓存的 Leader 地址查 cluster/status，
-	// 成员表不含自身即退出。查询失败不退出（宁可多留进程，不误杀节点）；gracefulExit
-	// 置位（人工优雅停机）后两条路径均不再生效。
+	// 成员表不含自身即退出。Leader 地址缓存仅在 Join 提交成功后建立（发现代理于
+	// Join 成功才上报，DESIGN §4.5），故条件 ② 查询到缺席即意味着本进程曾为成员、
+	// 现已被移除；正在加入或重连中的节点不持有缓存、不发起查询，不会被误杀。
+	// 查询失败不退出（宁可多留进程，不误杀节点）；gracefulExit 置位（人工优雅停机）
+	// 后两条路径均不再生效。
 	var gracefulExit atomic.Bool
 	go func() {
 		client := &http.Client{Timeout: 1500 * time.Millisecond}

@@ -1,7 +1,7 @@
 // Package discovery 实现发现代理（DESIGN §4.5、ADR-0008）：
-// 空 Raft 状态的节点启动后扫描 Seed List（排除自身），经 /internal/discovery
-// 寻找 Leader 并调用 Join API；Seed 全部不可达时指数退避重试——永不自举、不退出。
-// 加入成功后进入低频刷新，持续跟踪 Leader 的 HTTP 地址（Leader 更替后仍可 307）。
+// 节点（新加入或重连）每次启动都扫描 Seed List（排除自身），经 /internal/discovery
+// 寻找 Leader 并调用 Join API（幂等）；Seed 全部不可达时指数退避重试——永不自举、
+// 不退出。加入成功后进入低频刷新，持续跟踪 Leader 的 HTTP 地址（Leader 更替后仍可 307）。
 package discovery
 
 import (
@@ -32,8 +32,10 @@ type Options struct {
 	AdminToken    string
 	// RefreshPeriod 是加入成功后跟踪 Leader 地址的刷新周期，缺省 5s（测试可缩短）。
 	RefreshPeriod time.Duration
-	// OnLeader 在本节点获知 Leader 地址时被调用（含加入成功后与刷新期间）。
-	// raftAddr 供调用方校验缓存新鲜度（Leader 更换后旧 HTTP 地址立即失效）。
+	// OnLeader 在本节点确认 Leader 地址时被调用：已加入节点的刷新期间即时上报；
+	// 待加入节点在该次 Join 提交成功后才上报——调用发生即本节点已是成员，调用方的
+	// Leader 地址缓存可安全作为"本进程曾为成员"的判定依据。raftAddr 供调用方校验
+	// 缓存新鲜度（Leader 更换后旧 HTTP 地址立即失效）。
 	OnLeader func(leaderRaftAddr, leaderHTTPAddr string)
 }
 
@@ -44,17 +46,17 @@ type discoveryInfo struct {
 	LeaderHTTPAddr string `json:"leader_http_addr"`
 }
 
-// Run 阻塞运行发现代理直至 ctx 取消。alreadyMember 表示本地已有 Raft 状态
-// （成员表里已有自己，重启自愈场景）：跳过初始 Join，仅做刷新。
-func Run(ctx context.Context, log *slog.Logger, opts Options, alreadyMember bool) {
+// Run 阻塞运行发现代理直至 ctx 取消。每次进程启动都尝试 Join（幂等，DESIGN §4.5）：
+// 空状态节点加入集群；带状态节点属重连——已在成员表时 Join 为 200 空操作，曾被
+// 移除时（移除日志未及送达，或送达后进程才退出）重新 Join 是唯一自愈路径。本地
+// 有 Raft 状态只说明有持久化数据，不代表仍是成员。
+func Run(ctx context.Context, log *slog.Logger, opts Options) {
 	client := &http.Client{Timeout: scanTimeout}
 	backoff := time.Second
+	joined := false
 
-	joined := alreadyMember
-	if !joined {
-		log.Info("发现代理启动：扫描 Seed List 寻找 Leader",
-			"node_id", opts.NodeID, "seeds", opts.Seeds)
-	}
+	log.Info("发现代理启动：扫描 Seed List 寻找 Leader",
+		"node_id", opts.NodeID, "seeds", opts.Seeds)
 
 	refresh := opts.RefreshPeriod
 	if refresh == 0 {
@@ -79,6 +81,11 @@ func Run(ctx context.Context, log *slog.Logger, opts Options, alreadyMember bool
 		}
 		if joined {
 			// 刷新失败不算事件，保持低频。
+			sleepCtx(ctx, refresh)
+			continue
+		}
+		if len(opts.Seeds) == 0 {
+			// 无 Seed（如单节点部署重启）：无发现目标，安静待机（不自举、不退出）。
 			sleepCtx(ctx, refresh)
 			continue
 		}
@@ -111,15 +118,21 @@ func scanAndJoin(ctx context.Context, log *slog.Logger, client *http.Client, opt
 			continue
 		}
 		// Leader seed 直接 Join；Follower seed 从其缓存取 Leader HTTP 地址再试（DESIGN §4.5）。
-		if opts.OnLeader != nil {
-			opts.OnLeader(info.LeaderAddr, info.LeaderHTTPAddr)
-		}
+		// OnLeader（Leader HTTP 缓存）的建立即"本进程曾成功加入"的依据（被移除护栏据此
+		// 判定缺席是否成立）：待加入节点仅在 Join 提交成功后才上报，加入/重连进行中
+		// 不放行查询；已加入节点维持即时上报，跟踪 Leader 更替。
 		if joined {
+			if opts.OnLeader != nil {
+				opts.OnLeader(info.LeaderAddr, info.LeaderHTTPAddr)
+			}
 			return info.LeaderAddr, info.LeaderHTTPAddr, true
 		}
 		if err := sendJoin(ctx, client, opts, info.LeaderHTTPAddr); err != nil {
 			log.Warn("Join 失败", "leader", info.LeaderHTTPAddr, "err", err)
 			continue
+		}
+		if opts.OnLeader != nil {
+			opts.OnLeader(info.LeaderAddr, info.LeaderHTTPAddr)
 		}
 		return info.LeaderAddr, info.LeaderHTTPAddr, true
 	}
