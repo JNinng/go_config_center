@@ -1,4 +1,4 @@
-// FSM 幂等性属性测试（DESIGN §8.1）：随机化的 publish/delete/rollback 混合日志序列
+// FSM 幂等性属性测试（DESIGN §8 验证策略第 1 项）：随机化的 publish/delete/rollback 混合日志序列
 // 在重复投递、重启重放、快照/Restore 交错下，PG 终态与逐条结果必须逐次一致——
 // 这是跳过式恢复（ADR-0007）正确性的直接证明。
 package fsm
@@ -239,7 +239,7 @@ func TestFSMPropertyReplayDeterminism(t *testing.T) {
 				t.Fatalf("运行 A 终态与基准不一致")
 			}
 
-			// 运行 B：中途"重启"——新 FSM 实例重放全部日志（≤ last_applied 的必须跳过），
+			// 运行 B：中途"重启"——新 FSM 实例重放前半段（须跳过为 replayed），
 			// 再应用后半段，终态与结果必须与基准一致。
 			fB, stB, dsnB := mustNewFSM(t)
 			for i := 0; i < half; i++ {

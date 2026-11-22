@@ -118,7 +118,7 @@ func TestRunJoinsViaFollowerCache(t *testing.T) {
 	}
 }
 
-// Seed 全部不可达：持续退避重试，不退出、不自举。
+// Seed 全部不可达：持续退避重试，不退出、不 Bootstrap。
 func TestRunKeepsRetryingWhenSeedsUnreachable(t *testing.T) {
 	opts := Options{
 		NodeID: "n2", RaftAddr: "127.0.0.1:7947", HTTPAdvertise: "http://127.0.0.1:8081",
@@ -144,7 +144,8 @@ func TestRunKeepsRetryingWhenSeedsUnreachable(t *testing.T) {
 	}
 }
 
-// 自身地址被排除：seeds 只含自身时不发出任何请求。
+// isSelfAddr 契约：seed 等于通告地址或 Raft 地址即判定为自身——扫描时据此跳过，
+// seeds 只含自身则不发任何请求。
 func TestIsSelfAddr(t *testing.T) {
 	cases := []struct {
 		seed, advertise, raft string

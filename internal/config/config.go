@@ -25,7 +25,8 @@ type Config struct {
 	AdminToken    string   `yaml:"admin_token"`
 	PgDSN         string   `yaml:"pg_dsn"`
 	HTTPAdvertise string   `yaml:"http_advertise"`
-	Seeds         []string `yaml:"seeds"`
+	// Seeds 是 Seed List：启动时寻找 Leader 的候选 HTTP 地址，仅服务发现，不是成员真相源。
+	Seeds []string `yaml:"seeds"`
 	Raft          Raft     `yaml:"raft"`
 }
 

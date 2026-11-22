@@ -41,7 +41,7 @@ type snapshotHeader struct {
 	Checksum      string                  `json:"checksum"` // 数据体 sha256（hex）
 }
 
-// pgSnapshot 实现 raft.FSMSnapshot：Persist 把 spool 好数据体写入快照存储的 sink。
+// pgSnapshot 实现 raft.FSMSnapshot：Persist 把已 spool 到本地临时文件的数据体写入快照存储的 sink。
 type pgSnapshot struct {
 	header    snapshotHeader
 	spoolPath string

@@ -69,7 +69,7 @@ func TestSpaHandler(t *testing.T) {
 	}
 }
 
-// Handler 装配内嵌 dist：当前构建态下根路径服务 HTML 入口（构建产物或占位页均含挂载点）。
+// Handler 装配内嵌 dist：无论构建产物还是占位页，根路径均服务含挂载点的 HTML 入口。
 func TestHandlerServesIndex(t *testing.T) {
 	code, ct, got := body(t, mustHandler(t), "/")
 	if code != http.StatusOK || !strings.HasPrefix(ct, "text/html") {

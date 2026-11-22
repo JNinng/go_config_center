@@ -135,8 +135,8 @@ func TestApplyPublishCASCases(t *testing.T) {
 	}
 }
 
-// DESIGN §4.1：expected_version=0 在已删除（墓碑）条目上也要通过——删除后重建；
-// N>0 与墓碑版本匹配同样通过。删除 API 属票 03，这里直接落 Tombstone 行模拟。
+// DESIGN §4.1：expected=0 在已删除（墓碑）条目上也要通过——删除后重建；
+// N>0 与墓碑版本匹配同样通过。这里不经删除 API，直接落 Tombstone 行模拟。
 func TestApplyPublishCASAfterTombstone(t *testing.T) {
 	st, _ := mustOpen(t)
 	ctx := context.Background()

@@ -3,7 +3,7 @@
 // 票 14 验收：Namespace 管理（DESIGN §5.1 扩展）。
 // "新增"：Namespace 隐式创建（首次 Publish 生效），控制台引导创建首条即出现；
 // "删除"：DELETE /v1/namespaces/{ns} 原子删除该 ns 下全部存活条目并各写 Tombstone
-//（History 保留、可逐条回滚），幂等（空 ns 200 entries:0）。
+// （History 保留、可逐条回滚），幂等（空 ns 200 entries:0）。
 package e2e
 
 import (

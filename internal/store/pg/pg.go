@@ -64,7 +64,7 @@ type Store struct {
 
 // Open 连接 PostgreSQL（连接池）并返回存储实现。
 // 目标库不存在（SQLSTATE 3D000）时经维护库 postgres 自动创建后重连（DESIGN §6.2），
-// 要求连接账号具备 CREATEDB 权限，无权限则报错退出。
+// 要求连接账号具备 CREATEDB 权限，无权限则返回错误。
 func Open(ctx context.Context, dsn string) (*Store, error) {
 	pool, err := dial(ctx, dsn)
 	if err == nil {
@@ -561,8 +561,8 @@ func (s *Store) ListNamespaces(ctx context.Context) ([]string, error) {
 // ApplyDeleteNamespace 在单个 PG 事务内完成 op=delete_namespace（DESIGN §5.1）：
 // 删除该 Namespace 下全部存活条目，各追加一条 content 为 NULL 的 Tombstone
 //（墓碑版本 = 删除前版本 + 1，版本序列照常延续）+ 推进 raft_fsm_meta。
-// 单条 CTE 原子完成：DELETE ... RETURNING 取回 (data_id, version)，随即逐行
-// INSERT Tombstone——结果携带被删条目清单与墓碑版本，供 FSM 唤醒 Watch。
+// 单条 CTE 原子完成：DELETE ... RETURNING 的 (data_id, version) 直接作为
+// INSERT Tombstone 的输入——结果携带被删条目清单与墓碑版本，供 FSM 唤醒 Watch。
 // 无存活条目为空操作（Entries=0，幂等）。
 func (s *Store) ApplyDeleteNamespace(ctx context.Context, d raftlog.DeleteNamespaceData, ts time.Time, index, term uint64) (raftlog.Result, error) {
 	tctx, cancel := context.WithTimeout(ctx, applyTimeout)
@@ -669,6 +669,7 @@ func advanceMeta(ctx context.Context, tx pgx.Tx, index, term uint64) error {
 	return nil
 }
 
+// marshalTags 序列化 tags 为 JSON 字符串；nil 返回 (nil, nil)，落库为 NULL。
 func marshalTags(tags map[string]string) (*string, error) {
 	if tags == nil {
 		return nil, nil

@@ -3,21 +3,15 @@
 // e2e 验收套件（DESIGN §8 验证策略的可执行部分）：每个 TestTicketNN 对应
 // .scratch/config-center-mvp/issues/ 里的一张票，逐项断言该票的验收条件。
 //
-// 运行约定：
-//   - 构建标签 e2e：无标签时本目录不参与任何编译——go build ./...、go vet ./...、
-//     go test ./... 均不受影响，验收代码永不进入生产二进制。
-//   - 运行：go test -tags e2e ./scripts -run TestTicket01 -v -count=1
-//     （副作用测试：begin() 的 t.Setenv 已禁用 go test 结果缓存，-count=1 为双保险；
-//     全部票一次跑完用 -run TestTicket）。
+// 契约：
+//   - 构建标签 e2e：无标签时本目录不参与任何编译，验收代码永不进入生产二进制。
 //   - 黑盒：只经 HTTP API、psql 与被测二进制交互，不 import internal/*。
-//   - TestMain 把工作目录切到仓库根（等价各票脚本的 cd "$(dirname "$0")/.."）并构建
-//     ./config-center.exe；单节点组（票 01~05、07）使用仓库根 config.yaml 与 data/。
-//   - 前置条件：本机 PostgreSQL（psql -U postgresql 免密）、票 10/11 需 PowerShell
-//     （挂起/恢复进程）、空闲端口 HTTP 8080~8083 与 Raft 7946~7949。
-//   - 节点日志在 %TMP%/gcc-e2e-go/，按"票号-节点"命名。
-//   - 收场清理：每张票结束（含失败）由 begin 注册的 clearFixtures 清空全部 data
-//     目录与测试库（config_center_1..4）；GCC_E2E_KEEP=1 可跳过清理保留现场。
-//     单节点组的配置由套件生成（singleNodeConfig），仓库根 config.yaml 不被读取或改动。
+//   - TestMain 把工作目录切到仓库根并构建 ./config-center.exe；配置一律由套件
+//     生成（singleNodeConfig/writeConfig），仓库根 config.yaml 不被读取或改动。
+//   - 每张票结束（含失败）由 begin 注册的 clearFixtures 清空全部 data 目录与
+//     测试库（config_center_1..4）；GCC_E2E_KEEP=1 跳过清理保留现场。
+//
+// 前置条件、运行命令与输出约定见 scripts/README.md。
 package e2e
 
 import (
@@ -50,7 +44,7 @@ var (
 	clientDirect = &http.Client{
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	// clientFollow 跟随重定向（等价 curl -L）。
+	// clientFollow 跟随重定向（与 clientDirect 相对，写 Follower 后取最终结果）。
 	clientFollow = &http.Client{}
 	logDir       = filepath.Join(os.TempDir(), "gcc-e2e-go")
 
@@ -74,7 +68,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// —— 断言与输出（约定与原 bash 脚本一致：PASS:/FAIL: 行 + 结尾汇总） ——
+// —— 断言与输出：每条断言一行 PASS:/FAIL:，结尾汇总 ——
 
 func check(t *testing.T, ok bool, format string, args ...any) {
 	t.Helper()
@@ -221,8 +215,8 @@ func psqlQ(t *testing.T, db, query string) string {
 	return out
 }
 
-// dropTables 清空单节点组的库表（等价 DROP TABLE IF EXISTS ... CASCADE）；
-// 库本身不存在（被上轮收场清理删去）则无事可清，直接返回。
+// dropTables 清空单节点组的库表；库本身不存在（被上轮收场清理删去）则无事可清，
+// 直接返回。
 func dropTables(t *testing.T, db string) {
 	t.Helper()
 	if out, err := psql("postgres", "SELECT 1 FROM pg_database WHERE datname='"+db+"'"); err != nil || out != "1" {
@@ -233,7 +227,8 @@ func dropTables(t *testing.T, db string) {
 	}
 }
 
-// recreateDBs 删并重建多节点组的库（等价 DROP DATABASE IF EXISTS ... WITH (FORCE)）。
+// recreateDBs 删并重建多节点组的库（DROP DATABASE IF EXISTS ... WITH (FORCE)，
+// 保证无残留连接阻断）。
 func recreateDBs(t *testing.T, dbs ...string) {
 	t.Helper()
 	for _, db := range dbs {
@@ -249,7 +244,7 @@ func recreateDBs(t *testing.T, dbs ...string) {
 // —— HTTP ——
 
 type httpResult struct {
-	Code   int // 0 = 连接失败/超时等传输层错误（等价 curl 000）
+	Code   int // 0 = 连接失败/超时等传输层错误，未收到 HTTP 响应
 	Body   []byte
 	Header http.Header
 	Err    error
@@ -482,6 +477,8 @@ func waitVoters(port, want int, timeout time.Duration) bool {
 func leaderPort() int   { return portWithRole("leader") }
 func followerPort() int { return portWithRole("follower") }
 
+// portWithRole 扫描多节点组端口 8080~8082，返回角色匹配且 /healthz 200 的节点
+// HTTP 端口；找不到返回 0（leaderPort/followerPort 均基于此）。
 func portWithRole(role string) int {
 	for _, port := range []int{8080, 8081, 8082} {
 		if healthOK(port) {
@@ -552,7 +549,7 @@ func exitCode(err error) int {
 	return -1
 }
 
-// kill 强杀进程（等价 kill -9）并等待收场；进程已退出时为空操作。
+// kill 强杀进程并等待退出收场；进程已退出时为空操作。
 func (p *proc) kill() {
 	select {
 	case <-p.exited:
@@ -594,8 +591,8 @@ func runForeground(t *testing.T, args ...string) (int, string) {
 	return exitCode(err), string(out)
 }
 
-// writeConfig 生成节点配置文件（等价原脚本 gen_config）；raftExtra 附加在文件尾
-// （票 11 的小窗口调参），seeds 为空时省略。
+// writeConfig 生成节点配置文件；raftExtra 附加在文件尾（票 11 的小窗口调参），
+// seeds 为空时省略。
 func writeConfig(t *testing.T, path, id string, httpPort, raftPort int, db string, seeds []string, raftExtra string) {
 	t.Helper()
 	var b strings.Builder
@@ -652,7 +649,7 @@ func snapshotFiles(t *testing.T, dataDir string) []string {
 	return out
 }
 
-// newestSnapshotFile 取修改时间最新的快照 state 文件（等价 ls -t | head -1）。
+// newestSnapshotFile 取修改时间最新的快照 state 文件。
 func newestSnapshotFile(t *testing.T, dataDir string) string {
 	t.Helper()
 	var newest string

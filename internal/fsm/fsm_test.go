@@ -222,7 +222,7 @@ func TestApplyDeleteCASConflictCarriedBack(t *testing.T) {
 	}
 }
 
-// 删除后重建延续版本序列：墓碑占用的版本号不回收（DESIGN §3.1）。
+// 删除后重建延续版本序列：Tombstone 占用的版本号不回收（DESIGN §3.1）。
 func TestApplyDeleteThenRepublishContinuesVersion(t *testing.T) {
 	f, _, _ := mustFSM(t)
 	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
@@ -407,7 +407,7 @@ func deleteNamespaceLog(t *testing.T, index, term uint64, ns string) *raft.Log {
 }
 
 // 验收：delete_namespace 单日志原子删除全部条目（各写 Tombstone）、结果携带
-// 被删条目与墓碑版本、进度推进；删除后逐条回滚可重建。
+// 被删条目与各 Tombstone 版本、进度推进；删除后逐条回滚可重建。
 func TestApplyDeleteNamespaceRemovesAllAndAdvances(t *testing.T) {
 	f, st, dsn := mustFSM(t)
 	apply(t, f, publishLog(t, 1, 1, t.Name(), "a", "v1", nil))
@@ -436,7 +436,7 @@ func TestApplyDeleteNamespaceRemovesAllAndAdvances(t *testing.T) {
 		t.Fatalf("meta index = %d, want 4", idx)
 	}
 
-	// 删除后回滚重建：a 回滚到墓碑之前的 v1。
+	// 删除后回滚重建：a 回滚到 Tombstone 之前的 v1。
 	res = apply(t, f, rollbackLog(t, 5, 1, t.Name(), "a", 1))
 	if res.Status != raftlog.StatusOK || res.Version != 4 || !res.Created {
 		t.Fatalf("回滚重建 = %+v, want ok v4 created", res)

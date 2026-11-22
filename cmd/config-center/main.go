@@ -42,8 +42,8 @@ func main() {
 		bootstrap  = flag.Bool("bootstrap", false, "将空数据目录初始化为单节点新集群，仅首节点执行一次（ADR-0008）")
 	)
 	flag.Parse()
-	// raft-boltdb 对已完成读事务的惯用回滚会经 stdlib log 打 "Rollback failed: tx closed"，
-	// 属上游良性噪音，定向丢弃。
+	// raft-boltdb 每个事务都以惯用的 defer 回滚收尾，事务已提交/关闭时回滚返回错误，
+	// 经 stdlib log 打 "Rollback failed: tx closed"，属上游良性噪音，定向丢弃。
 	base := slog.NewTextHandler(os.Stderr, nil)
 	logger := slog.New(noiseFilter{base})
 	slog.SetDefault(logger)
@@ -492,16 +492,10 @@ func main() {
 		Console:     consoleHandler,
 	}).Routes()
 
-	// 被移除节点自退出（DESIGN §4.5）：下方循环每 2s 检查一次，命中任一条件即以专用
-	// 退出码 EXIT_REMOVED = 42 终止进程——① Raft 已关闭：ShutdownOnRemove（库默认开启）
-	// 仅在本节点作为 Leader、提交的成员表已不含自身时触发库内关闭，即移除 Leader
-	// 自身的场景；移除 Follower 时库不会关闭它（收不到任何 Raft 消息，投票请求也会被
-	// 成员节点拒绝）；② 非 Leader 节点向发现代理缓存的 Leader 地址查 cluster/status，
-	// 成员表不含自身即退出。Leader 地址缓存仅在 Join 提交成功后建立（发现代理于
-	// Join 成功才上报，DESIGN §4.5），故条件 ② 查询到缺席即意味着本进程曾为成员、
-	// 现已被移除；正在加入或重连中的节点不持有缓存、不发起查询，不会被误杀。
-	// 查询失败不退出（宁可多留进程，不误杀节点）；gracefulExit 置位（人工优雅停机）
-	// 后两条路径均不再生效。
+	// 被移除节点自退出（DESIGN §4.5）：每 2s 核对一次，命中即以退出码 42 终止——
+	// ① Raft 已关闭（ShutdownOnRemove 仅覆盖移除 Leader 自身的场景）；② 非 Leader 节点
+	// 以缓存的 Leader 地址查 cluster/status，成员表不含自身即退出。缓存仅于 Join 提交成功
+	// 后建立，加入中节点不持有缓存不会被误杀；查询失败不退出；gracefulExit 置位（优雅停机）后失效。
 	var gracefulExit atomic.Bool
 	go func() {
 		client := &http.Client{Timeout: 1500 * time.Millisecond}

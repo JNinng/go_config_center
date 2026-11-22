@@ -42,7 +42,7 @@ function roleBadge(suffrage: string): string {
   return 'badge accent'
 }
 
-// last_contact_ms 语义见 api.go：0=Leader 自身（无意义），-1=从未收到心跳，undefined=未知。
+// last_contact_ms 语义见 api.go：-1=从未收到心跳；0（Leader 自身或未知）经 omitempty 到前端均为 undefined，同样按 — 展示。
 function lastContact(ms?: number): string {
   if (ms === undefined || ms === 0) return '—'
   if (ms < 0) return '从未'

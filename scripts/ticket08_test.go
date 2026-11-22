@@ -135,7 +135,7 @@ func TestTicket08(t *testing.T) {
 	finish(t)
 }
 
-// putSettledRedirect 经 -L 语义重复 PUT 直到非 503（跟随 307；选举期间 503 重试）。
+// putSettledRedirect 跟随 307 重定向重复 PUT 直到非 503（选举期间按 503 重试）。
 func putSettledRedirect(port int, path string, body any) httpResult {
 	var r httpResult
 	for range 100 {

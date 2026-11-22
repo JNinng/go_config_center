@@ -23,7 +23,7 @@ function parse(): Route {
   return { name: 'home' }
 }
 
-// 由 main.ts 调用一次；页面导航用原生 href（#/...），不另设跳转函数。
+// 由 main.ts 调用一次。
 export function initRouter(): void {
   const update = () => {
     route.value = parse()

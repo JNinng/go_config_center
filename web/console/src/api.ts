@@ -26,6 +26,7 @@ export function clearToken(): void {
 /** 任一请求收到 401 时置位，由 App 层展示 token 输入；setToken 后复位。 */
 export const unauthorized = ref(false)
 
+/** 服务端错误封装：code 为服务端错误码（如 version_conflict、quorum_guard），currentVersion 仅版本冲突响应携带。 */
 export class ApiError extends Error {
   readonly status: number
   readonly code: string
@@ -113,6 +114,7 @@ export interface Member {
   online?: boolean
 }
 
+/** /v1/cluster/status 响应（DESIGN §5.2）：本节点视角；成员自报字段见 Member。 */
 export interface ClusterStatus {
   node_id: string
   role: string

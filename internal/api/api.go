@@ -47,7 +47,7 @@ type ClusterInfo struct {
 	LastApplied uint64
 	Restoring   bool
 
-	// 本节点 Raft 指标（DESIGN §5.2 状态卡与 §5.3 成员自报共用）。
+	// 本节点 Raft 指标（DESIGN §5.2 status 响应与 §5.3 成员自报共用）。
 	LastLogIndex uint64 // Raft 日志末端索引
 	CommitIndex  uint64 // 已提交索引
 	// LastContactMS 是到 Leader 的最近心跳距今毫秒数；0=自身为 Leader，-1=从未收到心跳。
@@ -72,7 +72,8 @@ type MemberInfo struct {
 }
 
 // JoinFunc 在 Leader 上执行成员加入（AddVoter，DESIGN §4.5）。
-// exists=true 表示该 Node ID 已是成员（幂等）。
+// exists=true 表示该 Node ID 已以相同 Raft 地址在成员表中（幂等）；
+// 同 Node ID 换地址时返回 false，由 AddVoter 按新地址覆盖。
 type JoinFunc func(nodeID, raftAddr, httpAddr string) (exists bool, err error)
 
 // RemoveFunc 在 Leader 上执行成员移除（DESIGN §4.5）。护栏不满足返回 ErrQuorumGuard，
@@ -700,7 +701,7 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "active", "entry": entryJSON(entry)})
 	case <-r.Context().Done():
-		// 客户端断开，连接已收场，无从写响应。
+		// 客户端断开，请求上下文已取消，无从写响应。
 	}
 }
 
@@ -770,7 +771,7 @@ func badRequest(w http.ResponseWriter, err error) {
 }
 
 // handleRemovePeer 处理成员移除（DESIGN §4.5/§5.2）：Leader 执行前做 quorum 护栏校验。
-// 200 移除成功；404 非成员；409 护栏拒绝；409/503 同写语义（非 Leader）。
+// 200 移除成功；404 非成员；409 护栏拒绝；非 Leader 同写语义（307/503）。
 func (s *Server) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})

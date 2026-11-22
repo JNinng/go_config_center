@@ -133,7 +133,7 @@ func TestSnapshotTriggerEndpoint(t *testing.T) {
 		t.Fatalf("无新日志快照 = %d, want 200", resp2.StatusCode)
 	}
 
-	// 非 Leader：本票返回 503（307 重定向属后续票）。
+	// 触发返回 ErrNoLeader → 503 + Retry-After。
 	srv3, _, cleanup3 := mustServer(t, func() bool { return true }, func() (uint64, error) {
 		return 0, ErrNoLeader
 	})

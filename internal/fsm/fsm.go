@@ -1,5 +1,5 @@
-// Package fsm 实现 PostgresFSM：将已提交的 Raft 日志事务性写入本机存储（DESIGN §3.3），
-// 经由 store.Store 接口访问存储后端（当前为 PostgreSQL，见 internal/store/pg）。
+// Package fsm 实现 raft.FSM：将已提交的 Raft 日志经 store.Store 接口事务性写入本机存储
+// （DESIGN §3.3），不感知具体后端（PostgreSQL 实现见 internal/store/pg）。
 package fsm
 
 import (
@@ -21,6 +21,7 @@ import (
 // defaultResultKeep 是 logIndex → 结果 表保留的近期条目数（DESIGN §3.3）。
 const defaultResultKeep = 4096
 
+// metrics 为本包共享的 Prometheus 指标集合（promauto 注册至默认 registry，进程级单例）。
 var metrics = struct {
 	applyDuration    *prometheus.HistogramVec
 	applyResults     *prometheus.CounterVec
@@ -111,7 +112,7 @@ func (f *FSM) Apply(l *raft.Log) interface{} {
 			return res
 		}
 		// 正常重启重放（追赶已应用日志）也走这里，只告警一次避免刷屏；
-		// 持续出现则说明 PG 进度越过 Raft 日志末端，启动护栏（DESIGN §6.2）应已拦截。
+		// 持续出现则说明 PG 进度越过 Raft 日志末端，lineage 护栏（DESIGN §6.2）应已拦截。
 		f.replayWarned.Do(func() {
 			f.log.Warn("命中跳过式重放：日志 index 不大于 last_applied 且无缓存结果",
 				"index", l.Index, "last_applied", f.lastIndex)
@@ -222,6 +223,7 @@ func (f *FSM) advanceOnly(l *raft.Log, reason error, msg string) raftlog.Result 
 	return raftlog.Result{Status: raftlog.StatusError, Err: reason.Error()}
 }
 
+// record 推进内存进度、缓存结果并更新 last_applied 指标；结果表仅保留 resultKeep 窗口内的条目。
 func (f *FSM) record(index, term uint64, res raftlog.Result) {
 	f.mu.Lock()
 	f.lastIndex = index

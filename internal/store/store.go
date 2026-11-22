@@ -1,5 +1,5 @@
 // Package store 定义存储后端契约（DESIGN §3.1/§3.3/§4.4）：FSM 的单事务业务写入、
-// 本机读路径、进度维护与快照数据体的导出/导入。当前实现为 PostgreSQL
+// 本机读路径、进度维护与快照数据体的导出/导入。内置 PostgreSQL 实现
 //（internal/store/pg）；pgx 依赖不得出现在本包及上游（fsm/api/cmd）——
 // 新后端（如 bbolt）实现 Store 接口即可接入（ADR-0011）。
 package store
@@ -25,7 +25,7 @@ type Store interface {
 	// Migrate 初始化存储结构（表/桶），幂等。
 	Migrate(ctx context.Context) error
 
-	// LoadMeta 返回 FSM 已应用进度（ raft_fsm_meta）。
+	// LoadMeta 返回 FSM 已应用进度（raft_fsm_meta）。
 	LoadMeta(ctx context.Context) (index, term uint64, err error)
 
 	// AdvanceMeta 仅推进进度，用于信封损坏或 op 未实现但日志已提交的场景，

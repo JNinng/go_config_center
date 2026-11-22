@@ -46,7 +46,7 @@ func TestEncodeDecodePublishRoundtrip(t *testing.T) {
 }
 
 func TestDecodeAcceptsWireFormatFromDesign(t *testing.T) {
-	// DESIGN §3.2 的信封原文（delete/rollback 本票不实现，但解码必须认识）。
+	// DESIGN §3.2 的信封原文：解码必须认识 delete/rollback（wire 兼容回归）。
 	for _, tc := range []struct {
 		wire string
 		op   Op

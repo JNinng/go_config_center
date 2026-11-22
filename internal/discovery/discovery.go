@@ -1,7 +1,8 @@
 // Package discovery 实现发现代理（DESIGN §4.5、ADR-0008）：
 // 节点（新加入或重连）每次启动都扫描 Seed List（排除自身），经 /internal/discovery
-// 寻找 Leader 并调用 Join API（幂等）；Seed 全部不可达时指数退避重试——永不自举、
-// 不退出。加入成功后进入低频刷新，持续跟踪 Leader 的 HTTP 地址（Leader 更替后仍可 307）。
+// 寻找 Leader 并调用 Join API（幂等）；Seed 全部不可达时指数退避重试——永不
+// Bootstrap、不退出。加入成功后进入低频刷新，持续跟踪 Leader 的 HTTP 地址（Leader
+// 更替后仍可 307）。
 package discovery
 
 import (
@@ -80,12 +81,12 @@ func Run(ctx context.Context, log *slog.Logger, opts Options) {
 			continue
 		}
 		if joined {
-			// 刷新失败不算事件，保持低频。
+			// 刷新失败不进入退避，维持低频。
 			sleepCtx(ctx, refresh)
 			continue
 		}
 		if len(opts.Seeds) == 0 {
-			// 无 Seed（如单节点部署重启）：无发现目标，安静待机（不自举、不退出）。
+			// 无 Seed（如单节点部署重启）：无发现目标，安静待机（不 Bootstrap、不退出）。
 			sleepCtx(ctx, refresh)
 			continue
 		}
@@ -118,9 +119,8 @@ func scanAndJoin(ctx context.Context, log *slog.Logger, client *http.Client, opt
 			continue
 		}
 		// Leader seed 直接 Join；Follower seed 从其缓存取 Leader HTTP 地址再试（DESIGN §4.5）。
-		// OnLeader（Leader HTTP 缓存）的建立即"本进程曾成功加入"的依据（被移除护栏据此
-		// 判定缺席是否成立）：待加入节点仅在 Join 提交成功后才上报，加入/重连进行中
-		// 不放行查询；已加入节点维持即时上报，跟踪 Leader 更替。
+		// OnLeader 时机遵守 Options.OnLeader 契约：joined=true 即时上报跟踪 Leader 更替；
+		// joined=false 待 Join 提交成功后才上报——调用即成员，被移除自退出据此判定缺席。
 		if joined {
 			if opts.OnLeader != nil {
 				opts.OnLeader(info.LeaderAddr, info.LeaderHTTPAddr)
