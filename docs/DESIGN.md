@@ -34,7 +34,7 @@
 |---|---|
 | API 层 | net/http，配置与集群 API、307 重定向、Watch 长轮询 |
 | Raft Core | hashicorp/raft + raft-boltdb（日志）+ FileSnapshotStore（快照落盘）+ 内置 TCP 传输 |
-| PostgresFSM | 将已提交日志事务性写入本机 PG；快照导出/导入 |
+| FSM | 将已提交日志经 `store.Store` 接口事务性写入本机存储（后端无关，默认 PostgreSQL 实现）；快照导出/导入 |
 | 发现代理 | 启动时扫描 Seed List 寻找 Leader 并 Join；加入后周期刷新 Leader 的 HTTP 地址（供 307 重定向） |
 
 数据流向：
@@ -113,6 +113,7 @@ CREATE TABLE raft_fsm_meta (
 - **Apply 幂等**：`index ≤ last_applied_index` 时跳过（重放安全）；同一 index 重复应用结果一致。
 - **Apply 原子**：业务表 + History + `raft_fsm_meta` 在单个 PG 事务内提交。
 - **Apply 与 Snapshot/Restore 串行**：由 Raft 单 goroutine 调度保证，FSM 内不建锁。
+- **不可业务化日志仅推进进度（advanceOnly）**：信封损坏、载荷非法、未知或尚未实现的 op 均已提交——跳过业务写入，仅推进 `raft_fsm_meta` 并回传错误结果，保证进度无空洞、毒日志不阻塞重放。
 - **Apply 结果回传**：CAS 失败、Rollback 目标无效等发生在**已提交日志的 Apply 阶段**——不是拒绝提案。FSM 维护 `logIndex → 结果` 表；API 处理方在提案应用完成后取回结果，据此返回 409/404。该表仅保留近期条目。
 
 ## 4. 核心机制
@@ -130,7 +131,7 @@ Expected Version（CAS）规则，`expected_version` 省略时为 LWW（最后�
 |---|---|
 | 省略 | 恒通过 |
 | `0` | 条目不存在**或**已删除（create-if-absent） |
-| `N > 0` | 条目当前 version = N（含墓碑版本） |
+| `N > 0` | 条目当前 version = N（含 Tombstone 占用的版本） |
 
 ### 4.2 版本、删除与回滚
 
@@ -173,7 +174,7 @@ Serving 门闩为进程内原子布尔；false 期间所有读 API 返回 **503 
 
 **Bootstrap**（ADR-0008）：全新集群仅在首节点执行一次 `--bootstrap`（单 voter 集群）；本地已有集群态时该命令必须报错退出。其余节点永久禁止自举——不存在"探测失败则自举"的路径。
 
-**Join**：新节点/重连节点启动后扫描 Seed List（排除自身地址），逐个调 `GET /internal/discovery`：对方为 Leader → 向其 `POST /v1/cluster/join`；对方为 Follower → 从响应取 Leader 地址再试。全部不可达 → 指数退避重试，永不自举、不退出。Leader 收到 Join 后 `AddVoter`，接口幂等（已是成员 → 200）。注：加入即 voter。hashicorp/raft 的设计文档（membership.md）提出过 staging——先以非投票身份加入、复制追平后自动转为 voter——但库从未实现，`AddVoter` 直接赋予投票权；Consul 等生产用法相同。
+**Join**：新节点/重连节点启动后扫描 Seed List（排除自身地址），逐个调 `GET /internal/discovery`：对方为 Leader → 向其 `POST /v1/cluster/join`；对方为 Follower → 从响应取 Leader 地址再试。全部不可达 → 指数退避重试，永不自举、不退出。Leader 收到 Join 后 `AddVoter`，接口幂等：Node ID 与 Raft 地址均相同 → 200 空操作；同 Node ID 换地址 → `AddVoter` 以新地址覆盖更新。注：加入即 voter。hashicorp/raft 的设计文档（membership.md）提出过 staging——先以非投票身份加入、复制追平后自动转为 voter——但库从未实现，`AddVoter` 直接赋予投票权；Consul 等生产用法相同。
 
 重连节点每次启动都重新 Join，不得以"本地有 Raft 状态"推断"仍是成员"——曾被移除的节点带既有数据目录重启时，本地成员表可能已不含自身（移除日志送达后进程退出），也可能仍含自身（下线早于移除日志复制，未收到移除）。两种情形重新 Join 均为唯一自愈路径；成员表变更日志不进 FSM（hashicorp/raft v1.7.3 仅 `LogCommand` 调 `fsm.Apply`），业务数据按 §4.4 跳过式恢复追平，重连无需清库。
 
@@ -215,7 +216,7 @@ Namespace 隐式创建（首次 Publish 即生效），无独立创建接口—�
 | 方法与路径 | 语义 |
 |---|---|
 | `GET /v1/cluster/status` | 本节点视角：`{node_id, role, term, leader_id, leader_addr, leader_http_addr, last_applied_index, last_log_index, commit_index, last_contact_ms, restoring, members: [{node_id, addr, suffrage, role?, term?, last_log_index?, commit_index?, applied_index?, last_contact_ms?, online?}]}`。任意节点可调。`last_contact_ms`：到 Leader 的最近心跳毫秒数，0=自身为 Leader，-1=从未收到心跳。成员行自报字段尽力而为：本节点行必有；其余成员经 `/internal/discovery` 探测（HTTP 地址需本节点 Join 时登记过）填充，缺省 = 本节点视角未知，`online` 仅区分已知在线/无响应，不臆断离线成员已下线 |
-| `POST /v1/cluster/join` | body `{node_id, raft_addr, http_addr?}`（http_addr 登记后供移除护栏探活）。202 已受理；幂等 200 |
+| `POST /v1/cluster/join` | body `{node_id, raft_addr, http_addr?}`（http_addr 登记后供移除护栏探活）。202 已受理；Node ID 与 Raft 地址均相同（幂等空操作）200 |
 | `POST /v1/cluster/snapshot` | 手动触发 FSM 快照（§4.4"达到阈值或手动触发"）。200 `{status:"ok", snapshot_index}`；快照点之后无新日志时再触发 200 `{status:"noop"}` |
 | `DELETE /v1/cluster/peers/{node_id}` | 移除成员。200；409 护栏拒绝；404 非成员 |
 
@@ -319,7 +320,7 @@ config-center --config config.yaml
 ## 8. 验证策略（各阶段完成定义）
 
 1. **FSM 幂等性属性测试**（单元，随机化）：任意日志序列（publish/delete/rollback 混合，含 CAS 失败项）重放多次、与 Snapshot/Restore 交错，PG 终态与结果表必须逐次一致。这是跳过式恢复正确性的直接依据。
-2. **混沌场景**（docker-compose：3 节点 + 3 PG + 场景脚本）：
+2. **混沌场景**（3 节点 + 3 独立 PG 拓扑 + 场景脚本；仓库根 `docker-compose.yml` 为本地三节点载体，e2e 套件以本机 1 PG 多库等价拓扑执行，见 [scripts/README](../scripts/README.md)）：
    - 写压测中杀 Leader：秒级完成选举，已提交写不丢，307/503 按语义返回；
    - Follower 分区 30s 后恢复：无人工干预追平；
    - 带数据节点重启：断言 ≤10s 就绪（跳过式恢复生效）；
@@ -333,7 +334,7 @@ config-center --config config.yaml
 ### Phase 1 — 单节点 MVP
 - PG 三表 schema 与启动迁移
 - Raft 集成：boltdb LogStore + FileSnapshotStore + 单节点 Bootstrap
-- PostgresFSM：Apply（三操作 + 幂等跳过 + 结果表）、快照导出、跳过式 Restore、Serving 门闩
+- FSM：Apply（幂等跳过 + advanceOnly + 结果表）、快照导出、跳过式 Restore、Serving 门闩
 - 配置 API：PUT/GET/DELETE + CAS；History/Rollback API；Watch 长轮询
 - Admin Token 认证、/healthz、/readyz、/metrics
 - **DoD**：幂等性属性测试通过；空库启动 ≤3s 断言；单节点全 API 集成测试

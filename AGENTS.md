@@ -35,7 +35,7 @@ bash scripts/build-console.sh   # 控制台：前端构建（需 node）+ go bui
 - 注释、日志、文档全用中文；doc comment 引用 DESIGN §/ADR 编号（如 `DESIGN §4.5`）。
 - **术语以 CONTEXT.md 为准**，尊重各词条 `_Avoid_` 列表：成员表（勿写"成员配置"，与业务 Config Entry 混淆）、Publish（勿写提交/commit）、Tombstone（勿写软删除）等。
 - **活文档（DESIGN/ADR/README/代码注释）只写契约与不变量**：不写"已修复/日期戳/当前实现"式过程叙述；`TODO(#issue)` 保留事项可留。
-- **断言 hashicorp/raft 行为前必须查模块缓存源码**（`go env GOMODCACHE` 下 `hashicorp/raft@v1.7.3`），禁止凭记忆——已发生过三次凭记忆写错（staging 转正、ShutdownOnRemove 触发条件、刷新周期）。
+- **断言 hashicorp/raft 行为前必须查模块缓存源码**（`go env GOMODCACHE` 下 `hashicorp/raft@v1.7.3`），禁止凭记忆。
 - `.scratch/` 是过程记录归档：不重写票的规格与验收历史；但其中以"已验证"口吻的失实技术断言应修正（完整机制只在 DESIGN 留一处，票档引用不双写）。
 
 ## 已知坑

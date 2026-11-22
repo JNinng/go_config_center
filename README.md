@@ -11,6 +11,7 @@
 - **快速启动**：空库首启 ≤3s；10 万条配置冷重启 ≤10s（跳过式快照恢复）
 - **轻量部署**：单二进制 + 每节点一个独立 PostgreSQL，无其他外部依赖
 - **可观测**：Prometheus 指标（共识状态、Apply 延迟、Watch 挂起、快照健康）与 `/healthz` `/readyz` 健康端点
+- **内嵌控制台**：单二进制内嵌 Web 管理界面（配置浏览、发布、回滚、删除与 Namespace 管理），构建期 node 构建、运行期零依赖
 
 ## 快速开始
 
@@ -69,6 +70,8 @@ curl "http://127.0.0.1:8080/v1/namespaces/dev/configs/db.password/watch?v=1&time
 | `DELETE /v1/namespaces/{ns}/configs/{data_id}?expected_version=N` | 删除并写 Tombstone |
 | `GET .../versions?limit=50&before_version=` | 历史版本倒序分页 |
 | `POST .../rollback` | body `{to_version}`，发布为新版本 |
+| `GET /v1/namespaces` | 存活 Namespace 清单（字典序） |
+| `DELETE /v1/namespaces/{ns}` | 原子删除该 Namespace 下全部存活条目并各写 Tombstone，幂等 |
 | `GET .../watch?v=N&timeout=30s` | 长轮询变更通知 |
 | `GET /v1/cluster/status` | 集群视图（角色、Leader、成员表、Apply 进度） |
 | `POST /v1/cluster/join` · `DELETE /v1/cluster/peers/{node_id}` | 成员加入 / 移除（移除带 quorum 护栏） |
